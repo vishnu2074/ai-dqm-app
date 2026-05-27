@@ -1,68 +1,19 @@
 # app/main.py
 
 import os
-from fastapi import FastAPI
+import sys
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse as _FileResponse
+from fastapi.responses import FileResponse as _FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path as _Path
-from sqlalchemy import text
 
-from app.database import engine, Base, seed_governance_data
-
-
-def _bootstrap_sqlite_schema():
-    try:
-        with engine.connect() as conn:
-            exists = conn.execute(
-                text("SELECT name FROM sqlite_master WHERE type='table' AND name='dq_rules'")
-            ).fetchone()
-            if not exists:
-                return
-            cols = conn.execute(text("PRAGMA table_info(dq_rules)")).fetchall()
-            existing = {row[1] for row in cols}
-            if "input_mode" not in existing:
-                conn.exec_driver_sql(
-                    "ALTER TABLE dq_rules ADD COLUMN input_mode VARCHAR NOT NULL DEFAULT 'manual'"
-                )
-            if "nl_text" not in existing:
-                conn.exec_driver_sql("ALTER TABLE dq_rules ADD COLUMN nl_text TEXT")
-            if "regex_pattern" not in existing:
-                conn.exec_driver_sql("ALTER TABLE dq_rules ADD COLUMN regex_pattern TEXT")
-            if "meta" not in existing:
-                conn.exec_driver_sql("ALTER TABLE dq_rules ADD COLUMN meta JSON")
-            conn.commit()
-    except Exception as e:
-        print(f"Schema bootstrap warning: {e}")
-
-
-# ── Create tables and seed ────────────────────────────────────────────────────
-try:
-    from app import models  # noqa: F401
-    Base.metadata.create_all(bind=engine)
-    _bootstrap_sqlite_schema()
-    seed_governance_data()
-    # Start periodic DB backup to Azure Blob (every 5 minutes)
-    from app.database import start_periodic_backup
-    start_periodic_backup(interval_seconds=300)
-except Exception as e:
-    print(f"DB bootstrap warning (non-fatal): {e}")
-
-# ── App ───────────────────────────────────────────────────────────────────────
+# ── App — created FIRST before any imports that might fail ───────────────────
 app = FastAPI(title="AI DQM Backend", version="2.5.0")
 
-# ── CORS ──────────────────────────────────────────────────────────────────────
-_DATABRICKS_URL = os.getenv("DATABRICKS_APP_URL", "")
-
-# Health dashboard URLs — add your Render health-dashboard URL here after deploy
-_HEALTH_DASHBOARD_URLS = [
-    "http://localhost:5174",
-    "http://localhost:5173",
-    "http://localhost:8001",
-]
-_RENDER_HEALTH_DASHBOARD = os.getenv("HEALTH_DASHBOARD_URL", "")
-if _RENDER_HEALTH_DASHBOARD:
-    _HEALTH_DASHBOARD_URLS.append(_RENDER_HEALTH_DASHBOARD)
+# ── CORS ─────────────────────────────────────────────────────────────────────
+_HEALTH_DASHBOARD_URL = os.getenv("HEALTH_DASHBOARD_URL", "")
+_extra = [_HEALTH_DASHBOARD_URL] if _HEALTH_DASHBOARD_URL else []
 
 app.add_middleware(
     CORSMiddleware,
@@ -71,7 +22,9 @@ app.add_middleware(
         "http://localhost:3000",
         "http://127.0.0.1:5173",
         "http://127.0.0.1:3000",
-        *_HEALTH_DASHBOARD_URLS,
+        "http://localhost:5174",
+        "http://localhost:8001",
+        *_extra,
         "*",
     ],
     allow_credentials=True,
@@ -79,199 +32,214 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── API health (before SPA catch-all) ────────────────────────────────────────
-@app.get("/health", include_in_schema=False)
-def health():
-    return {"status": "ok", "version": "2.5.0"}
+# ── Startup errors collector ──────────────────────────────────────────────────
+_STARTUP_ERRORS: list[str] = []
 
+# ── Health endpoints — registered immediately, before anything else ───────────
+@app.get("/health", include_in_schema=False)
 @app.get("/api/health", include_in_schema=False)
 def api_health():
-    return {"status": "ok", "version": "2.5.0"}
+    return {
+        "status": "ok",
+        "version": "2.5.0",
+        "startup_errors": _STARTUP_ERRORS,
+        "python": sys.version,
+    }
 
 @app.post("/api/backup-db", include_in_schema=False)
 def backup_db():
-    """Manually trigger a DB backup to Azure Blob."""
-    from app.database import upload_db_to_blob
-    ok = upload_db_to_blob()
-    return {"status": "ok" if ok else "skipped", "blob": "ai-dqm/ai_dqm.db"}
+    try:
+        from app.database import upload_db_to_blob
+        ok = upload_db_to_blob()
+        return {"status": "ok" if ok else "skipped", "blob": "ai-dqm/ai_dqm.db"}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+
+# ── Database bootstrap ────────────────────────────────────────────────────────
+try:
+    from sqlalchemy import text
+    from app.database import engine, Base, seed_governance_data
+
+    def _bootstrap_sqlite_schema():
+        try:
+            with engine.connect() as conn:
+                exists = conn.execute(
+                    text("SELECT name FROM sqlite_master WHERE type='table' AND name='dq_rules'")
+                ).fetchone()
+                if not exists:
+                    return
+                cols = conn.execute(text("PRAGMA table_info(dq_rules)")).fetchall()
+                existing = {row[1] for row in cols}
+                for col, defn in [
+                    ("input_mode", "VARCHAR NOT NULL DEFAULT 'manual'"),
+                    ("nl_text",    "TEXT"),
+                    ("regex_pattern", "TEXT"),
+                    ("meta",       "JSON"),
+                ]:
+                    if col not in existing:
+                        conn.exec_driver_sql(f"ALTER TABLE dq_rules ADD COLUMN {col} {defn}")
+                conn.commit()
+        except Exception as e:
+            _STARTUP_ERRORS.append(f"schema_bootstrap: {e}")
+
+    from app import models  # noqa: F401
+    Base.metadata.create_all(bind=engine)
+    _bootstrap_sqlite_schema()
+    seed_governance_data()
+    try:
+        from app.database import start_periodic_backup
+        start_periodic_backup(interval_seconds=300)
+    except Exception as e:
+        _STARTUP_ERRORS.append(f"periodic_backup: {e}")
+    print("[startup] DB bootstrap complete")
+except Exception as e:
+    msg = f"DB bootstrap FAILED: {e}"
+    _STARTUP_ERRORS.append(msg)
+    print(f"[startup] WARNING: {msg}")
+
+
+# ── Router loader helper ──────────────────────────────────────────────────────
+def _load(label: str, fn):
+    try:
+        fn()
+        print(f"[router] ✓ {label}")
+    except Exception as e:
+        msg = f"{label}: {e}"
+        _STARTUP_ERRORS.append(msg)
+        print(f"[router] ✗ {msg}")
+
 
 # ── Routers ───────────────────────────────────────────────────────────────────
-
-try:
+def _reg_datasources():
     from app.routers import datasources
     app.include_router(datasources.router, prefix="/datasources", tags=["datasources"])
-    print("Datasources router loaded")
-except Exception as e:
-    print(f"Datasources router failed: {e}")
+_load("datasources", _reg_datasources)
 
-try:
+def _reg_datasets():
     from app.routers import datasets
     app.include_router(datasets.router, prefix="/datasets", tags=["datasets"])
-    print("Datasets router loaded")
-except Exception as e:
-    print(f"Datasets router failed: {e}")
+_load("datasets", _reg_datasets)
 
-try:
+def _reg_global_context():
     from app.routers import global_context
     app.include_router(global_context.router, prefix="/context", tags=["context"])
-    print("Global context router loaded")
-except Exception as e:
-    print(f"Global context router failed: {e}")
+_load("global_context", _reg_global_context)
 
-try:
+def _reg_lineage():
     from app.routers import lineage
     app.include_router(lineage.router)
-    print("Lineage router loaded")
-except Exception as e:
-    print(f"Lineage router failed: {e}")
+_load("lineage", _reg_lineage)
 
-try:
+def _reg_impact():
     from app.routers import impact
     app.include_router(impact.router)
-    print("Impact router loaded")
-except Exception as e:
-    print(f"Impact router failed: {e}")
+_load("impact", _reg_impact)
 
-try:
-    from app.routers.dq_failure import router as dq_failure_router
-    app.include_router(dq_failure_router)
-    print("DQ Failure router loaded")
-except Exception as e:
-    print(f"DQ Failure router failed: {e}")
+def _reg_dq_failure():
+    from app.routers.dq_failure import router as r
+    app.include_router(r)
+_load("dq_failure", _reg_dq_failure)
 
-try:
-    from app.routers.lineage_edges import router as lineage_edges_router
-    app.include_router(lineage_edges_router)
-    print("Lineage Edges router loaded")
-except Exception as e:
-    print(f"Lineage Edges router failed: {e}")
+def _reg_lineage_edges():
+    from app.routers.lineage_edges import router as r
+    app.include_router(r)
+_load("lineage_edges", _reg_lineage_edges)
 
-try:
+def _reg_governance():
     from app.routers.governance_routes import governance_router
     app.include_router(governance_router, prefix="/governance", tags=["governance"])
-    print("Governance router loaded")
-except Exception as e:
-    print(f"Governance router failed: {e}")
+_load("governance", _reg_governance)
 
-try:
+def _reg_notifications():
     from app.routers.notification_inbox_routes import notification_inbox_router
     app.include_router(notification_inbox_router, tags=["notifications"])
-    print("Notification Inbox router loaded")
-except Exception as e:
-    print(f"Notification Inbox router failed: {e}")
+_load("notifications", _reg_notifications)
 
-try:
+def _reg_policy():
     from app.routers.policy_suggestions_routes import policy_suggestions_router
     app.include_router(policy_suggestions_router)
-    print("Policy Suggestions router loaded")
-except Exception as e:
-    print(f"Policy Suggestions router failed: {e}")
+_load("policy_suggestions", _reg_policy)
 
-try:
+def _reg_dq_scores():
     from app.routers import dq_scores
     app.include_router(dq_scores.router, prefix="/dq-scores", tags=["dq-scores"])
-    print("DQ Scores router loaded")
-except Exception as e:
-    print(f"DQ Scores router failed: {e}")
+_load("dq_scores", _reg_dq_scores)
 
-try:
+def _reg_profiling():
     from app.routers import profiling_detail
     app.include_router(profiling_detail.router, prefix="/profiling-detail", tags=["profiling-detail"])
-    print("Profiling Detail router loaded")
-except Exception as e:
-    print(f"Profiling Detail router failed: {e}")
+_load("profiling_detail", _reg_profiling)
 
-try:
+def _reg_dq_rules():
     from app.routers import dq_rules
     app.include_router(dq_rules.router)
-    print("DQ Rules router loaded")
-except Exception as e:
-    print(f"DQ Rules router failed: {e}")
+_load("dq_rules", _reg_dq_rules)
 
-try:
+def _reg_dq_engine():
     from app.routers import dq_engine
     app.include_router(dq_engine.router)
-    print("DQ Engine router loaded")
-except Exception as e:
-    print(f"DQ Engine router failed: {e}")
+_load("dq_engine", _reg_dq_engine)
 
-try:
-    from app.routers.quality_snapshots import router as quality_snapshots_router, QualitySnapshot
-    QualitySnapshot.__table__.create(bind=engine, checkfirst=True)
-    app.include_router(quality_snapshots_router)
-    print("Quality Snapshots router loaded")
-except Exception as e:
-    print(f"Quality Snapshots router failed: {e}")
+def _reg_quality_snapshots():
+    from app.routers.quality_snapshots import router as r, QualitySnapshot
+    from app.database import engine as _engine
+    QualitySnapshot.__table__.create(bind=_engine, checkfirst=True)
+    app.include_router(r)
+_load("quality_snapshots", _reg_quality_snapshots)
 
-try:
+def _reg_anomalies():
     from app.routers import anomalies
     app.include_router(anomalies.router)
-    print("Anomalies router loaded")
-except Exception as e:
-    print(f"Anomalies router failed: {e}")
+_load("anomalies", _reg_anomalies)
 
-try:
+def _reg_scorecards():
     from app.routers import scorecards
     app.include_router(scorecards.router, prefix="/scorecards", tags=["scorecards"])
-    print("Scorecards router loaded")
-except Exception as e:
-    print(f"Scorecards router failed: {e}")
+_load("scorecards", _reg_scorecards)
 
-try:
+def _reg_monitoring():
     from app.routers import monitoring
     app.include_router(monitoring.router, prefix="/monitoring", tags=["monitoring"])
-    print("Monitoring router loaded")
-except Exception as e:
-    print(f"Monitoring router failed: {e}")
+_load("monitoring", _reg_monitoring)
 
-try:
+def _reg_alerts():
     from app.routers import alerts
     app.include_router(alerts.router)
-    print("Alerts router loaded")
-except Exception as e:
-    print(f"Alerts router failed: {e}")
+_load("alerts", _reg_alerts)
 
-try:
+def _reg_kg():
     from app.routers import knowledge_graph
     from app.models import KnowledgeGraphEdge
-    KnowledgeGraphEdge.__table__.create(bind=engine, checkfirst=True)
+    from app.database import engine as _engine
+    KnowledgeGraphEdge.__table__.create(bind=_engine, checkfirst=True)
     app.include_router(knowledge_graph.router)
-    print("Knowledge Graph router loaded")
-except Exception as e:
-    print(f"Knowledge Graph router failed: {e}")
+_load("knowledge_graph", _reg_kg)
 
-try:
+def _reg_ai_agent():
     from app.routers import ai_agent
     app.include_router(ai_agent.router)
-    print("AI Agent router loaded")
-except Exception as e:
-    print(f"AI Agent router failed: {e}")
+_load("ai_agent", _reg_ai_agent)
 
-try:
+def _reg_overview():
     from app.routers import overview_dashboard
     app.include_router(overview_dashboard.router, prefix="/api")
-    print("Overview Dashboard router loaded")
-except Exception as e:
-    print(f"Overview Dashboard router failed: {e}")
+_load("overview_dashboard", _reg_overview)
 
 # ── Profiling scheduler ───────────────────────────────────────────────────────
-try:
+def _start_scheduler():
     from app.routers.profiling_detail import start_scheduler
     start_scheduler()
-    print("Profiling scheduler started")
-except Exception as e:
-    print(f"Profiling scheduler failed to start: {e}")
+_load("profiling_scheduler", _start_scheduler)
 
-# ── Health Metrics Router (for AI DQM Health Dashboard) ──────────────────────
-try:
-    from app.routers.health_metrics_router import router as health_metrics_router
-    app.include_router(health_metrics_router)
-    print("Health Metrics router loaded at /api/health-metrics")
-except Exception as e:
-    print(f"Health metrics router failed: {e}")
+# ── Health Metrics Router ─────────────────────────────────────────────────────
+def _reg_health_metrics():
+    from app.routers.health_metrics_router import router as hm_router
+    app.include_router(hm_router)
+_load("health_metrics_router", _reg_health_metrics)
 
 
-# ── Frontend static files — MUST be registered AFTER all API routers ─────────
+# ── Frontend static files — registered LAST, after ALL API routes ─────────────
 _THIS_FILE   = _Path(__file__).resolve()
 _APP_DIR     = _THIS_FILE.parent
 _SOURCE_ROOT = _APP_DIR.parent
@@ -280,8 +248,11 @@ _FRONTEND_DIST = _APP_DIR / "static"
 if not (_FRONTEND_DIST / "index.html").exists():
     _FRONTEND_DIST = _SOURCE_ROOT / "Frontend v25" / "dist"
 
-print(f"[startup] Frontend dist: {_FRONTEND_DIST}")
+print(f"[startup] Frontend dist:     {_FRONTEND_DIST}")
 print(f"[startup] index.html exists: {(_FRONTEND_DIST / 'index.html').exists()}")
+print(f"[startup] Startup errors:    {len(_STARTUP_ERRORS)}")
+for err in _STARTUP_ERRORS:
+    print(f"[startup]   ✗ {err}")
 
 if (_FRONTEND_DIST / "index.html").exists():
     _assets = _FRONTEND_DIST / "assets"
@@ -296,16 +267,17 @@ if (_FRONTEND_DIST / "index.html").exists():
 
     @app.get("/{full_path:path}", include_in_schema=False)
     def _serve_spa(full_path: str):
-        # Guard: never serve index.html for /api/* paths.
-        # This prevents the React SPA from swallowing health-metrics and other API routes.
+        # IMPORTANT: Never intercept /api/* — let FastAPI 404 naturally for unknown API paths.
+        # This guard is a safety net; all real /api/ routes are registered above
+        # and FastAPI matches them before this catch-all runs.
+        # The ONLY way this guard fires is if someone requests a genuinely
+        # non-existent /api/... path — return proper JSON 404 in that case.
         if full_path.startswith("api/") or full_path == "api":
-            from fastapi.responses import JSONResponse
             return JSONResponse({"detail": "Not Found"}, status_code=404)
         return _FileResponse(str(_FRONTEND_DIST / "index.html"))
 
     print("[startup] SPA catch-all registered — frontend active")
 else:
-    print("[startup] WARNING: index.html not found — serving API only")
-    print(f"[startup] Checked: {_FRONTEND_DIST / 'index.html'}")
+    print("[startup] WARNING: index.html not found — API-only mode")
 
-print("[startup] AI DQM Backend started with Health Metrics support")
+print("[startup] AI DQM Backend ready ✓")
