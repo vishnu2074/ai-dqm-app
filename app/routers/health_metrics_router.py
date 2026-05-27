@@ -26,6 +26,49 @@ from fastapi import APIRouter, Query
 
 router = APIRouter(prefix="/api/health-metrics", tags=["health-metrics"])
 
+
+@router.get("/debug")
+def debug_info():
+    """Diagnostic — shows DB path resolution and table counts."""
+    import os, sqlite3
+    candidates_checked = []
+    for p in _DB_CANDIDATES:
+        resolved = os.path.abspath(p)
+        candidates_checked.append({"path": resolved, "exists": os.path.exists(resolved)})
+    env_path = os.getenv("AIDQM_DB_PATH", "")
+    db_path = _get_db_path()
+    tables = []
+    row_counts = {}
+    if db_path:
+        try:
+            con = sqlite3.connect(db_path, timeout=5)
+            tables = [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+            for t in tables:
+                try:
+                    row_counts[t] = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                except:
+                    row_counts[t] = "error"
+            con.close()
+        except Exception as e:
+            tables = [f"ERROR: {e}"]
+    # Also try reading from SQLAlchemy engine if available
+    sa_db_url = ""
+    try:
+        from app.database import engine
+        sa_db_url = str(engine.url)
+    except Exception as e:
+        sa_db_url = f"unavailable: {e}"
+    return {
+        "db_found": db_path,
+        "env_AIDQM_DB_PATH": env_path,
+        "sqlalchemy_url": sa_db_url,
+        "candidates_checked": candidates_checked,
+        "tables": tables,
+        "row_counts": row_counts,
+        "cwd": os.getcwd(),
+        "__file__": os.path.abspath(__file__),
+    }
+
 # ── Database path — same DB the main AI DQM app uses ──────────────────────────
 # The main AI DQM app typically stores its SQLite DB in the app root or a data/ folder.
 # Adjust this path if your app stores it elsewhere.
@@ -42,31 +85,74 @@ _DB_CANDIDATES = [
 ]
 
 def _get_db_path() -> Optional[str]:
+    # 1. Environment variable override (highest priority)
+    env_path = os.getenv("AIDQM_DB_PATH", "")
+    if env_path and os.path.exists(env_path):
+        return env_path
+
+    # 2. Try to extract path from SQLAlchemy engine URL
+    try:
+        from app.database import engine
+        url = str(engine.url)
+        # sqlite:////absolute/path/to/db  or  sqlite:///relative/path
+        if url.startswith("sqlite"):
+            db_file = url.replace("sqlite:///", "").replace("sqlite://", "")
+            if db_file and os.path.exists(db_file):
+                return db_file
+            # try as absolute
+            if db_file.startswith("/") and os.path.exists(db_file):
+                return db_file
+    except Exception:
+        pass
+
+    # 3. Walk candidate paths
     for p in _DB_CANDIDATES:
         resolved = os.path.abspath(p)
         if os.path.exists(resolved):
             return resolved
-    # Try environment variable
-    env_path = os.getenv("AIDQM_DB_PATH", "")
-    if env_path and os.path.exists(env_path):
-        return env_path
+
     return None
 
 
-def _query(sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
-    """Run a read-only query against the SQLite database."""
+def _query(sql: str, params=None) -> List[Dict[str, Any]]:
+    """Run a read-only query — tries SQLAlchemy engine first, falls back to sqlite3.
+    params can be a dict (named :param style) or tuple (positional ? style).
+    """
+    if params is None:
+        params = {}
+
+    # --- Try SQLAlchemy engine (same connection the main app uses) ---
+    try:
+        from app.database import engine
+        from sqlalchemy import text as _text
+        with engine.connect() as conn:
+            # SQLAlchemy needs dict params with named placeholders
+            sa_params = params if isinstance(params, dict) else {}
+            result = conn.execute(_text(sql), sa_params)
+            cols = list(result.keys())
+            return [dict(zip(cols, row)) for row in result.fetchall()]
+    except Exception:
+        pass  # fall through to sqlite3
+
+    # --- Fallback: direct sqlite3 file access ---
     db_path = _get_db_path()
     if not db_path:
+        print(f"[health-metrics] DB not found. Set AIDQM_DB_PATH env var.")
         return []
     try:
         con = sqlite3.connect(db_path, timeout=10)
         con.row_factory = sqlite3.Row
-        cur = con.execute(sql, params)
+        # sqlite3 needs tuple params with ? placeholders
+        sqlite_params = tuple(params.values()) if isinstance(params, dict) else (params if params else ())
+        # Convert named placeholders to ? for sqlite3 fallback
+        import re
+        sqlite_sql = re.sub(r":([a-zA-Z_][a-zA-Z0-9_]*)", "?", sql)
+        cur = con.execute(sqlite_sql, sqlite_params)
         rows = [dict(r) for r in cur.fetchall()]
         con.close()
         return rows
     except Exception as e:
-        print(f"[health-metrics] DB query error: {e}")
+        print(f"[health-metrics] sqlite3 query error: {e} | sql: {sql[:80]}")
         return []
 
 
@@ -77,6 +163,19 @@ def _scalar(sql: str, params: tuple = (), default=0):
         return default
     first = list(rows[0].values())
     return first[0] if first else default
+
+
+def _query_sa(sql: str, **kwargs) -> List[Dict[str, Any]]:
+    """SQLAlchemy named-param query helper for parameterised queries."""
+    try:
+        from app.database import engine
+        from sqlalchemy import text as _text
+        with engine.connect() as conn:
+            result = conn.execute(_text(sql), kwargs)
+            cols = result.keys()
+            return [dict(zip(cols, row)) for row in result.fetchall()]
+    except Exception:
+        return []
 
 
 def _status(value: float, good_threshold: float = 80, warn_threshold: float = 60) -> str:
@@ -99,8 +198,8 @@ def _fetch_datasets(dataset_id: Optional[int] = None) -> List[Dict]:
     sql = "SELECT id, display_name, physical_name, source_id FROM datasets"
     params = ()
     if dataset_id:
-        sql += " WHERE id = ?"
-        params = (dataset_id,)
+        sql += " WHERE id = :dataset_id"
+        params = {"dataset_id": dataset_id}
     return _query(sql, params)
 
 
@@ -108,16 +207,16 @@ def _fetch_profiling_runs(dataset_id: Optional[int] = None) -> List[Dict]:
     sql = "SELECT * FROM profiling_runs ORDER BY started_at DESC LIMIT 100"
     params = ()
     if dataset_id:
-        sql = "SELECT * FROM profiling_runs WHERE dataset_id = ? ORDER BY started_at DESC LIMIT 20"
-        params = (dataset_id,)
+        sql = "SELECT * FROM profiling_runs WHERE dataset_id = :dataset_id ORDER BY started_at DESC LIMIT 20"
+        params = {"dataset_id": dataset_id}
     return _query(sql, params)
 
 
 def _fetch_latest_run(dataset_id: Optional[int] = None) -> Optional[Dict]:
     if dataset_id:
         rows = _query(
-            "SELECT * FROM profiling_runs WHERE dataset_id = ? AND status = 'completed' "
-            "ORDER BY completed_at DESC LIMIT 1", (dataset_id,)
+            "SELECT * FROM profiling_runs WHERE dataset_id = :dataset_id AND status = 'completed' "
+            "ORDER BY completed_at DESC LIMIT 1", {"dataset_id": dataset_id}
         )
     else:
         rows = _query(
@@ -129,25 +228,25 @@ def _fetch_latest_run(dataset_id: Optional[int] = None) -> Optional[Dict]:
 
 def _fetch_column_metrics(run_id: int) -> List[Dict]:
     return _query(
-        "SELECT * FROM column_metrics WHERE run_id = ?", (run_id,)
+        "SELECT * FROM column_metrics WHERE run_id = :run_id", {"run_id": run_id}
     )
 
 
 def _fetch_quality_checks(run_id: Optional[int] = None, dataset_id: Optional[int] = None) -> List[Dict]:
     if run_id:
-        return _query("SELECT * FROM quality_checks WHERE run_id = ?", (run_id,))
+        return _query("SELECT * FROM quality_checks WHERE run_id = :run_id", {"run_id": run_id})
     if dataset_id:
         return _query(
             "SELECT qc.* FROM quality_checks qc "
             "JOIN profiling_runs pr ON qc.run_id = pr.id "
-            "WHERE pr.dataset_id = ?", (dataset_id,)
+            "WHERE pr.dataset_id = :dataset_id", {"dataset_id": dataset_id}
         )
     return _query("SELECT * FROM quality_checks LIMIT 500")
 
 
 def _fetch_dq_rules(dataset_id: Optional[int] = None) -> List[Dict]:
     if dataset_id:
-        return _query("SELECT * FROM dq_rules WHERE dataset_id = ?", (dataset_id,))
+        return _query("SELECT * FROM dq_rules WHERE dataset_id = :dataset_id", {"dataset_id": dataset_id})
     return _query("SELECT * FROM dq_rules LIMIT 500")
 
 
@@ -156,14 +255,14 @@ def _fetch_anomalies(dataset_id: Optional[int] = None) -> List[Dict]:
         return _query(
             "SELECT a.* FROM anomalies a "
             "JOIN profiling_runs pr ON a.run_id = pr.id "
-            "WHERE pr.dataset_id = ?", (dataset_id,)
+            "WHERE pr.dataset_id = :dataset_id", {"dataset_id": dataset_id}
         )
     return _query("SELECT * FROM anomalies LIMIT 500")
 
 
 def _fetch_drift_records(run_id: Optional[int] = None) -> List[Dict]:
     if run_id:
-        return _query("SELECT * FROM drift_records WHERE run_id = ?", (run_id,))
+        return _query("SELECT * FROM drift_records WHERE run_id = :run_id", {"run_id": run_id})
     return _query("SELECT * FROM drift_records LIMIT 500")
 
 
@@ -206,8 +305,8 @@ def _fetch_llm_interactions(dataset_id: Optional[int] = None) -> List[Dict]:
     try:
         if dataset_id:
             return _query(
-                "SELECT * FROM llm_interactions WHERE dataset_id = ? ORDER BY created_at DESC LIMIT 100",
-                (dataset_id,)
+                "SELECT * FROM llm_interactions WHERE dataset_id = :dataset_id ORDER BY created_at DESC LIMIT 100",
+                {"dataset_id": dataset_id}
             )
         return _query("SELECT * FROM llm_interactions ORDER BY created_at DESC LIMIT 200")
     except:
@@ -989,11 +1088,21 @@ def _build_feedback_tab() -> Dict:
 @router.get("/datasets-list")
 def get_datasets_list():
     """Return list of all registered datasets for the dataset selector."""
-    datasets = _fetch_datasets()
-    return [
-        {"id": d["id"], "display_name": d.get("display_name") or d.get("physical_name", f"Dataset {d['id']}")}
-        for d in datasets
-    ]
+    # Query all possible name columns — handles different schema versions
+    rows = _query("SELECT id, name, display_name, physical_name FROM datasets LIMIT 200")
+    if not rows:
+        # Fallback: minimal query
+        rows = _query("SELECT id, name FROM datasets LIMIT 200")
+    result = []
+    for d in rows:
+        display = (
+            d.get("display_name")
+            or d.get("name")
+            or d.get("physical_name")
+            or f"Dataset {d.get('id', '?')}"
+        )
+        result.append({"id": d["id"], "display_name": display})
+    return result
 
 
 @router.get("/")
