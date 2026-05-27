@@ -296,6 +296,11 @@ if (_FRONTEND_DIST / "index.html").exists():
 
     @app.get("/{full_path:path}", include_in_schema=False)
     def _serve_spa(full_path: str):
+        # Guard: never serve index.html for /api/* paths.
+        # This prevents the React SPA from swallowing health-metrics and other API routes.
+        if full_path.startswith("api/") or full_path == "api":
+            from fastapi.responses import JSONResponse
+            return JSONResponse({"detail": "Not Found"}, status_code=404)
         return _FileResponse(str(_FRONTEND_DIST / "index.html"))
 
     print("[startup] SPA catch-all registered — frontend active")

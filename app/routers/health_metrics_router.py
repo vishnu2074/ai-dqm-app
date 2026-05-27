@@ -995,6 +995,7 @@ def get_datasets_list():
     ]
 
 
+@router.get("/")
 @router.get("")
 def get_all_metrics(dataset_id: Optional[int] = Query(None)):
     """
