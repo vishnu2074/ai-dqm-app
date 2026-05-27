@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+sqlalchemy>=2.0.0
+pydantic
+azure-storage-blob
+cryptography
+pandas
+numpy
+openpyxl
+python-multipart
+openai>=1.0.0
+groq
+aiofiles
+psycopg2-binary
+databricks-sql-connector>=3.0.0
+httpx

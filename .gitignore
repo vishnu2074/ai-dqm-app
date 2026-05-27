@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.databricks/
+sync-snapshots/
+.env
+ai_dqm.db
+app.yaml
+render.yaml
+migrate_to_delta.py
+test_conn.py
+verify_migration.py
