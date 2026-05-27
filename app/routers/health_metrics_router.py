@@ -449,6 +449,7 @@ def _build_dq_rules_tab(rules) -> Dict:
     )
     ai_never_fired = [r for r in ai_suggested if r.get("id") not in all_check_rule_ids]
     hallucinated_rate = round((len(ai_never_fired) / len(ai_suggested) * 100) if ai_suggested else 0, 1)
+    hallucination_rate = round(hallucinated_rate, 1)
 
     return {
         "tab": "DQ Rules",
@@ -474,7 +475,7 @@ def _build_dq_rules_tab(rules) -> Dict:
             {
                 "id": "hallucinated_rule_rate",
                 "label": "Hallucinated Rule Rate",
-                "value": hallucination_rate := round(hallucinated_rate, 1),
+                "value": hallucination_rate,
                 "unit": "%",
                 "status": _status(100 - hallucination_rate, 90, 75),
                 "formula": "ai_rules_never_fired / total_ai_rules × 100 (proxy for invalid rules)",
