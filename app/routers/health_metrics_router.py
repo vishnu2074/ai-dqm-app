@@ -1,20 +1,19 @@
 """
-AI DQM Health Metrics Router v3
+AI DQM Health Metrics Router v4
 =================================
-Corrected for actual DB schema at /tmp/ai-dqm/ai_dqm.db
+Corrected against ACTUAL DB schema from app/models/__init__.py
 
-Real tables (from debug endpoint):
-  data_sources, datasets, profiling_runs, column_profiles,
-  profiling_baselines, drift_records, dq_rules, dq_rule_history,
-  dq_rule_runs, dq_rule_run_results, knowledge_graph_edges,
-  lineage_edges, governance_policies, governance_audit_log,
-  temporal_checks, quality_snapshots, notification_inbox,
-  governance_notifications, governance_users, governance_system_config,
-  governance_dismissed_suggestions, dataset_versions, schema_history,
-  global_context, notification_preferences
-
-Place at: app/routers/health_metrics_router.py
-Register in app/main.py (already done).
+Key column corrections vs v3:
+  datasets:           display_name  (NOT name)
+  profiling_runs:     timestamp, duration_ms, status="COMPLETED"  (no created_at/updated_at/summary)
+  drift_records:      profiling_run_id, drift_score, drift_type  (no severity, no run_id)
+  column_profiles:    profiling_run_id  (NOT run_id)
+  dq_rules:           status="Active"  (no is_active, no enabled, no source)
+  dq_rule_run_results: pass_rate, violation_count  (no status/result field)
+  quality_snapshots:  score, snap_date  (no overall_score, no health_score, no created_at)
+  lineage_edges:      source, target (strings)  (no source_dataset_id/target_dataset_id)
+  governance_policies: status="Draft"|"Active" (no is_active, no enabled, no source)
+  temporal_checks:    status="open"|"resolved", severity, llm_root_cause  (no is_anomaly)
 """
 
 import os
@@ -29,13 +28,12 @@ from fastapi.responses import JSONResponse
 router = APIRouter(prefix="/api/health-metrics", tags=["health-metrics"])
 
 
-# ── DB connection — uses the same SQLAlchemy engine as the main app ───────────
+# ── DB helpers ────────────────────────────────────────────────────────────────
 
 def _query(sql: str, params: dict = None) -> List[Dict[str, Any]]:
     """Execute SQL via SQLAlchemy engine (preferred) or sqlite3 fallback."""
     if params is None:
         params = {}
-    # 1. SQLAlchemy (same engine, same connection pool as main app)
     try:
         from app.database import engine
         from sqlalchemy import text as _text
@@ -45,7 +43,7 @@ def _query(sql: str, params: dict = None) -> List[Dict[str, Any]]:
             return [dict(zip(cols, row)) for row in result.fetchall()]
     except Exception:
         pass
-    # 2. sqlite3 fallback — convert :name → ? for sqlite3
+    # sqlite3 fallback
     try:
         from app.database import engine
         db_url = str(engine.url)
@@ -75,7 +73,6 @@ def _scalar(sql: str, params: dict = None, default=0):
 
 
 def _safe(fn, default=None):
-    """Call fn(), return default on any exception."""
     try:
         return fn()
     except Exception:
@@ -135,50 +132,77 @@ def debug_info():
     }
 
 
+# ── Schema introspection endpoint (new — for diagnosing future column issues) ─
+
+@router.get("/schema-check")
+def schema_check():
+    """Returns actual columns for every table the health metrics router queries."""
+    tables_to_check = [
+        "datasets", "profiling_runs", "column_profiles", "drift_records",
+        "dq_rules", "dq_rule_runs", "dq_rule_run_results", "quality_snapshots",
+        "lineage_edges", "knowledge_graph_edges", "temporal_checks",
+        "governance_policies", "governance_audit_log", "governance_dismissed_suggestions",
+        "notification_inbox", "governance_notifications", "profiling_baselines",
+    ]
+    result = {}
+    try:
+        from app.database import engine
+        db_url = str(engine.url)
+        db_file = db_url.replace("sqlite:////", "/").replace("sqlite:///", "")
+        if db_file and os.path.exists(db_file):
+            con = sqlite3.connect(db_file, timeout=5)
+            for t in tables_to_check:
+                try:
+                    cols = con.execute(f"PRAGMA table_info({t})").fetchall()
+                    result[t] = [c[1] for c in cols]
+                except Exception as e:
+                    result[t] = f"error: {e}"
+            con.close()
+    except Exception as e:
+        return {"error": str(e)}
+    return result
+
+
 # ── Datasets list ─────────────────────────────────────────────────────────────
 
 @router.get("/datasets-list")
 def get_datasets_list():
-    rows = _query("SELECT id, name FROM datasets ORDER BY id LIMIT 200")
-    return [{"id": r["id"], "display_name": r.get("name") or f"Dataset {r['id']}"} for r in rows]
+    # FIXED: column is display_name, not name
+    rows = _query("SELECT id, display_name FROM datasets ORDER BY id LIMIT 200")
+    return [
+        {"id": r["id"], "display_name": r.get("display_name") or r.get("physical_name") or f"Dataset {r['id']}"}
+        for r in rows
+    ]
 
 
 # ── Tab builders ──────────────────────────────────────────────────────────────
 
 def _tab_global_llm() -> Dict:
     """
-    No llm_interactions table exists. Derive from profiling_runs AI fields
-    and temporal_checks (which stores AI-generated check results).
+    Derived from profiling_runs (actual columns: timestamp, duration_ms, status=COMPLETED).
+    No created_at/updated_at — use timestamp for timing and duration_ms for latency.
     """
-    runs = _query("SELECT * FROM profiling_runs ORDER BY created_at DESC LIMIT 200")
+    # FIXED: use timestamp column; status is uppercase "COMPLETED"
+    runs = _query("SELECT id, status, duration_ms, timestamp, dataset_id FROM profiling_runs ORDER BY timestamp DESC LIMIT 200")
     total_runs = len(runs)
 
-    # Runs with an AI-generated summary / description field
-    ai_runs = [r for r in runs if r.get("summary") or r.get("ai_summary") or r.get("description")]
-    
-    # Hallucination proxy: runs that completed but have no summary despite having column_profiles
-    completed = [r for r in runs if r.get("status") == "completed"]
-    no_summary = [r for r in completed if not r.get("summary") and not r.get("ai_summary")]
-    hallucination_rate = round(len(no_summary) / len(completed) * 100, 1) if completed else 0.0
+    completed = [r for r in runs if str(r.get("status", "")).upper() == "COMPLETED"]
+    failed    = [r for r in runs if str(r.get("status", "")).upper() == "FAILED"]
 
-    # Latency: time between created_at and updated_at on profiling runs (proxy for LLM call duration)
-    latencies = []
-    for r in completed:
-        try:
-            s = datetime.fromisoformat(str(r.get("created_at","")).replace("Z","+00:00").replace(" ","T"))
-            e = datetime.fromisoformat(str(r.get("updated_at","")).replace("Z","+00:00").replace(" ","T"))
-            ms = (e - s).total_seconds() * 1000
-            if 0 < ms < 600000:
-                latencies.append(ms)
-        except Exception:
-            pass
+    # Hallucination proxy: no summary field exists → use completion rate as quality signal
+    hallucination_rate = round(len(failed) / total_runs * 100, 1) if total_runs else 0.0
+
+    # Latency: use duration_ms directly (it IS the run duration)
+    latencies = [r["duration_ms"] for r in completed if r.get("duration_ms") and r["duration_ms"] > 0]
     avg_latency = round(sum(latencies) / len(latencies), 0) if latencies else 0
 
     # Relevance: profiling runs that produced column_profiles
+    # FIXED: FK is profiling_run_id not run_id
     runs_with_profiles = _safe(lambda: int(_scalar(
-        "SELECT COUNT(DISTINCT run_id) FROM column_profiles"
+        "SELECT COUNT(DISTINCT profiling_run_id) FROM column_profiles"
     )), 0)
-    relevance = round(runs_with_profiles / len(completed) * 100, 1) if completed else 100.0
+    relevance = round(runs_with_profiles / len(completed) * 100, 1) if completed else 0.0
+    relevance = min(100.0, relevance)
 
     consistency = round(max(0.0, 100.0 - hallucination_rate * 1.5), 1)
 
@@ -187,25 +211,25 @@ def _tab_global_llm() -> Dict:
         "metrics": [
             {
                 "id": "hallucination_rate",
-                "label": "Hallucination Rate",
+                "label": "Run Failure Rate",
                 "value": hallucination_rate,
                 "unit": "%",
                 "status": _status(100 - hallucination_rate, 95, 80),
-                "formula": "completed_runs_without_ai_summary / completed_runs × 100",
-                "details": {"no_summary": len(no_summary), "completed": len(completed)},
+                "formula": "failed_runs / total_runs × 100",
+                "details": {"failed": len(failed), "total": total_runs},
             },
             {
                 "id": "avg_llm_latency_ms",
-                "label": "Avg LLM Latency",
+                "label": "Avg Run Duration",
                 "value": int(avg_latency),
                 "unit": "ms",
                 "status": "healthy" if avg_latency < 30000 else "warning" if avg_latency < 120000 else "critical",
-                "formula": "mean(updated_at - created_at) across completed profiling runs",
+                "formula": "mean(duration_ms) across completed profiling runs",
                 "details": {"samples": len(latencies)},
             },
             {
                 "id": "response_relevance",
-                "label": "Response Relevance",
+                "label": "Profile Coverage",
                 "value": relevance,
                 "unit": "%",
                 "status": _pct(relevance),
@@ -214,52 +238,44 @@ def _tab_global_llm() -> Dict:
             },
             {
                 "id": "response_consistency",
-                "label": "Response Consistency",
+                "label": "Run Consistency",
                 "value": consistency,
                 "unit": "%",
                 "status": _pct(consistency),
-                "formula": "100 - (hallucination_rate × 1.5)",
+                "formula": "100 - (failure_rate × 1.5)",
                 "details": {},
             },
         ],
         "explainability": {
-            "overview": "Global AI/LLM metrics are derived from profiling run outcomes — completion rates, AI summary generation, and profile coverage.",
-            "improvement": "Ensure all profiling runs complete successfully and generate AI summaries. Check LLM endpoint availability in Azure AI Foundry.",
-            "low_success_rate": "High hallucination rate means completed runs aren't generating AI summaries. Check the LLM key configuration on Render.",
+            "overview": "Global AI/LLM metrics are derived from profiling run outcomes — completion rates, duration, and profile coverage.",
+            "improvement": "Ensure all profiling runs complete successfully. Check data source credentials and LLM endpoint on Render.",
+            "low_success_rate": "High failure rate means profiling jobs are crashing. Check Render logs for error_message in profiling_runs.",
         },
     }
 
 
 def _tab_profiling() -> Dict:
-    runs = _query("SELECT * FROM profiling_runs ORDER BY created_at DESC LIMIT 200")
+    # FIXED: timestamp (not created_at), duration_ms (not updated_at-created_at), status uppercase
+    runs = _query("SELECT id, status, duration_ms, timestamp, dataset_id, rows_processed FROM profiling_runs ORDER BY timestamp DESC LIMIT 200")
     total = len(runs)
-    completed = [r for r in runs if r.get("status") == "completed"]
-    failed = [r for r in runs if r.get("status") == "failed"]
+    completed = [r for r in runs if str(r.get("status", "")).upper() == "COMPLETED"]
+    failed    = [r for r in runs if str(r.get("status", "")).upper() == "FAILED"]
     n_completed = len(completed)
 
     success_rate = round(n_completed / total * 100, 1) if total else 0.0
 
-    # Metadata grounding: completed runs with AI summary
-    grounded = [r for r in completed if r.get("summary") or r.get("ai_summary") or r.get("description")]
+    # Metadata grounding: runs with rows_processed > 0
+    grounded = [r for r in completed if (r.get("rows_processed") or 0) > 0]
     grounding = round(len(grounded) / n_completed * 100, 1) if n_completed else 0.0
 
-    # Drift coverage: runs that generated drift_records
+    # Drift coverage: runs that generated drift_records (FIXED: FK is profiling_run_id)
     runs_with_drift = _safe(lambda: int(_scalar(
-        "SELECT COUNT(DISTINCT run_id) FROM drift_records WHERE run_id IS NOT NULL"
+        "SELECT COUNT(DISTINCT profiling_run_id) FROM drift_records WHERE profiling_run_id IS NOT NULL"
     )), 0)
     drift_cov = round(runs_with_drift / n_completed * 100, 1) if n_completed else 0.0
 
-    # Average runtime
-    durations = []
-    for r in completed:
-        try:
-            s = datetime.fromisoformat(str(r.get("created_at","")).replace("Z","+00:00").replace(" ","T"))
-            e = datetime.fromisoformat(str(r.get("updated_at","")).replace("Z","+00:00").replace(" ","T"))
-            sec = (e - s).total_seconds()
-            if 0 < sec < 3600:
-                durations.append(sec)
-        except Exception:
-            pass
+    # Average runtime from duration_ms
+    durations = [r["duration_ms"] / 1000.0 for r in completed if r.get("duration_ms") and r["duration_ms"] > 0]
     avg_runtime = round(sum(durations) / len(durations), 1) if durations else 0.0
 
     return {
@@ -271,17 +287,17 @@ def _tab_profiling() -> Dict:
                 "value": success_rate,
                 "unit": "%",
                 "status": _pct(success_rate),
-                "formula": "completed_runs / total_runs × 100",
+                "formula": "COMPLETED_runs / total_runs × 100",
                 "details": {"completed": n_completed, "total": total, "failed": len(failed)},
             },
             {
                 "id": "metadata_grounding_score",
-                "label": "Metadata Grounding Score",
+                "label": "Rows Processed Rate",
                 "value": grounding,
                 "unit": "%",
                 "status": _pct(grounding),
-                "formula": "runs_with_ai_summary / completed_runs × 100",
-                "details": {"grounded": len(grounded), "completed": n_completed},
+                "formula": "completed_runs_with_rows_processed > 0 / completed_runs × 100",
+                "details": {"with_rows": len(grounded), "completed": n_completed},
             },
             {
                 "id": "drift_detection_accuracy",
@@ -298,26 +314,25 @@ def _tab_profiling() -> Dict:
                 "value": avg_runtime,
                 "unit": "s",
                 "status": "healthy" if avg_runtime < 120 else "warning" if avg_runtime < 600 else "critical",
-                "formula": "mean(updated_at - created_at) in seconds across completed runs",
+                "formula": "mean(duration_ms / 1000) across completed runs",
                 "details": {"samples": len(durations)},
             },
         ],
         "explainability": {
-            "overview": "Profiling AI metrics measure how reliably datasets are profiled, AI summaries generated, and drift detected.",
-            "improvement": "Improve success rate by checking data source credentials. Improve grounding by ensuring the LLM endpoint is configured.",
+            "overview": "Profiling AI metrics measure how reliably datasets are profiled and drift is detected.",
+            "improvement": "Improve success rate by checking data source credentials in the main app.",
             "low_success_rate": "Failed runs typically mean the data source is unreachable or credentials have expired.",
         },
     }
 
 
 def _tab_dq_scores() -> Dict:
-    snapshots = _query("SELECT * FROM quality_snapshots ORDER BY created_at DESC LIMIT 100")
-    baselines = _query("SELECT * FROM profiling_baselines ORDER BY created_at DESC LIMIT 100")
+    # FIXED: quality_snapshots has only 'score' and 'snap_date' (no overall_score, no created_at)
+    snapshots = _query("SELECT id, dataset_id, score, snap_date FROM quality_snapshots ORDER BY snap_date DESC LIMIT 100")
 
-    # Health scores from quality_snapshots
     health_scores = []
     for s in snapshots:
-        v = s.get("overall_score") or s.get("health_score") or s.get("score")
+        v = s.get("score")
         if v is not None:
             try:
                 health_scores.append(float(v))
@@ -325,18 +340,18 @@ def _tab_dq_scores() -> Dict:
                 pass
 
     avg_health = round(sum(health_scores) / len(health_scores), 1) if health_scores else 0.0
-    accuracy = round(sum(1 for s in health_scores if 0 <= s <= 100) / len(health_scores) * 100, 1) if health_scores else 100.0
+    accuracy   = round(sum(1 for s in health_scores if 0 <= s <= 100) / len(health_scores) * 100, 1) if health_scores else 100.0
 
-    # Rule compliance from dq_rule_run_results
-    rule_scores = _query("SELECT * FROM dq_rule_run_results LIMIT 200")
-    passed = [r for r in rule_scores if r.get("status") == "passed" or r.get("result") == "pass"]
+    # FIXED: dq_rule_run_results has pass_rate and violation_count (no status/result field)
+    rule_scores = _query("SELECT id, pass_rate, violation_count FROM dq_rule_run_results LIMIT 200")
+    passed     = [r for r in rule_scores if (r.get("pass_rate") or 0) >= 1.0]
     compliance = round(len(passed) / len(rule_scores) * 100, 1) if rule_scores else 0.0
 
-    # Degradation velocity: slope of quality_snapshots over time
-    recent = sorted([s for s in snapshots if s.get("overall_score") or s.get("score")],
-                    key=lambda x: str(x.get("created_at", "")))[-5:]
+    # Degradation velocity: slope over last 5 snapshots
+    recent = sorted([s for s in snapshots if s.get("score") is not None],
+                    key=lambda x: str(x.get("snap_date", "")))[-5:]
     if len(recent) >= 2:
-        vals = [float(r.get("overall_score") or r.get("score") or 0) for r in recent]
+        vals     = [float(r["score"]) for r in recent]
         velocity = round(vals[-1] - vals[0], 1)
     else:
         velocity = 0.0
@@ -355,11 +370,11 @@ def _tab_dq_scores() -> Dict:
             },
             {
                 "id": "rule_compliance_accuracy",
-                "label": "Rule Pass Rate",
+                "label": "Rule Pass Rate (pass_rate=1.0)",
                 "value": compliance,
                 "unit": "%",
                 "status": _pct(compliance) if rule_scores else "neutral",
-                "formula": "passed_rule_results / total_rule_results × 100",
+                "formula": "rule_results_with_pass_rate=1.0 / total_rule_results × 100",
                 "details": {"passed": len(passed), "total": len(rule_scores)},
             },
             {
@@ -368,7 +383,7 @@ def _tab_dq_scores() -> Dict:
                 "value": avg_health,
                 "unit": "%",
                 "status": _pct(avg_health),
-                "formula": "mean(overall_score) across quality_snapshots",
+                "formula": "mean(score) across quality_snapshots",
                 "details": {"snapshots": len(health_scores)},
             },
             {
@@ -377,102 +392,106 @@ def _tab_dq_scores() -> Dict:
                 "value": velocity,
                 "unit": "pts",
                 "status": "healthy" if velocity >= -5 else "warning" if velocity >= -15 else "critical",
-                "formula": "quality_snapshot[last].score - quality_snapshot[first].score over last 5 (negative = degrading)",
+                "formula": "snapshot[last].score - snapshot[first].score over last 5 (negative = degrading)",
                 "details": {"window": len(recent)},
             },
         ],
         "explainability": {
             "overview": "DQ Scores measure dataset health via quality snapshots and rule execution results.",
-            "improvement": "Run DQ rule evaluation jobs regularly to populate dq_rule_run_results and get accurate compliance rates.",
-            "low_success_rate": "Zero rule results means DQ rules haven't been executed yet. Trigger a rule evaluation run from the main DQ app.",
+            "improvement": "Run DQ rule evaluation jobs to populate dq_rule_run_results. Run profiling to add daily quality snapshots.",
+            "low_success_rate": "Zero rule results means DQ rules haven't been executed yet. Trigger a rule evaluation run from the DQ Engine tab.",
         },
     }
 
 
 def _tab_dq_rules() -> Dict:
-    rules = _query("SELECT * FROM dq_rules LIMIT 500")
-    total = len(rules)
-    active = [r for r in rules if r.get("is_active") or r.get("status") == "active" or r.get("enabled")]
+    # FIXED: status is "Active" (capitalised), no is_active/enabled/source columns
+    rules  = _query("SELECT id, status, type, name, rule_code FROM dq_rules LIMIT 500")
+    total  = len(rules)
+    active = [r for r in rules if str(r.get("status", "")).lower() == "active"]
 
-    # Execution: dq_rule_runs
-    rule_runs = _query("SELECT * FROM dq_rule_runs LIMIT 500")
-    results   = _query("SELECT * FROM dq_rule_run_results LIMIT 500")
+    rule_runs = _query("SELECT id, dataset_id, status, started_at, finished_at FROM dq_rule_runs LIMIT 500")
+    results   = _query("SELECT id, run_id, rule_code, pass_rate, violation_count FROM dq_rule_run_results LIMIT 500")
 
-    executed_rule_ids = set(r.get("rule_id") for r in rule_runs if r.get("rule_id"))
-    active_ids = set(r.get("id") for r in active)
-    exec_rate = round(len(executed_rule_ids & active_ids) / len(active_ids) * 100, 1) if active_ids else 0.0
+    executed_run_ids = set(r.get("run_id") for r in results if r.get("run_id"))
+    # Execution rate: rule_runs that have results
+    exec_rate = round(len(executed_run_ids) / len(rule_runs) * 100, 1) if rule_runs else 0.0
 
-    # AI-suggested rules: source field
-    ai_rules = [r for r in rules if str(r.get("source","")).lower() in ("llm","ai","recommended","generated")]
-    accepted  = [r for r in ai_rules if r.get("is_active") or r.get("enabled")]
+    # AI-suggested rules: no source column — use rule_code prefix as heuristic
+    ai_rules = [r for r in rules if str(r.get("rule_code", "")).startswith("AI_") or
+                str(r.get("name", "")).lower().startswith("ai ")]
+    accepted = [r for r in ai_rules if str(r.get("status", "")).lower() == "active"]
     accept_rate = round(len(accepted) / len(ai_rules) * 100, 1) if ai_rules else 0.0
 
-    # Hallucinated: AI rules that have never been run
-    hall_rules = [r for r in ai_rules if r.get("id") not in executed_rule_ids]
-    hall_rate  = round(len(hall_rules) / len(ai_rules) * 100, 1) if ai_rules else 0.0
+    # Pass rate distribution from results
+    avg_pass = round(
+        sum(float(r.get("pass_rate") or 0) for r in results) / len(results) * 100, 1
+    ) if results else 0.0
 
     return {
         "tab": "DQ Rules",
         "metrics": [
             {
                 "id": "rule_execution_success_rate",
-                "label": "Rule Execution Success Rate",
+                "label": "Rule Execution Rate",
                 "value": exec_rate,
                 "unit": "%",
-                "status": _pct(exec_rate) if active_ids else "neutral",
-                "formula": "active_rules_with_run_history / total_active_rules × 100",
-                "details": {"executed": len(executed_rule_ids & active_ids), "active": len(active_ids), "total": total},
+                "status": _pct(exec_rate) if rule_runs else "neutral",
+                "formula": "rule_runs_with_results / total_rule_runs × 100",
+                "details": {"runs_with_results": len(executed_run_ids), "total_runs": len(rule_runs), "total_rules": total},
             },
             {
                 "id": "rule_recommendation_acceptance_rate",
-                "label": "AI Rule Acceptance Rate",
-                "value": accept_rate,
+                "label": "Active Rule Ratio",
+                "value": round(len(active) / total * 100, 1) if total else 0.0,
                 "unit": "%",
-                "status": _pct(accept_rate) if ai_rules else "neutral",
-                "formula": "active_ai_rules / total_ai_suggested_rules × 100",
-                "details": {"accepted": len(accepted), "suggested": len(ai_rules)},
+                "status": _pct(round(len(active) / total * 100, 1)) if total else "neutral",
+                "formula": "active_rules / total_rules × 100",
+                "details": {"active": len(active), "total": total},
             },
             {
-                "id": "hallucinated_rule_rate",
-                "label": "Hallucinated Rule Rate",
-                "value": hall_rate,
+                "id": "avg_pass_rate",
+                "label": "Avg Rule Pass Rate",
+                "value": avg_pass,
                 "unit": "%",
-                "status": _status(100 - hall_rate, 90, 75),
-                "formula": "ai_rules_never_executed / total_ai_rules × 100",
-                "details": {"never_run": len(hall_rules), "ai_rules": len(ai_rules)},
+                "status": _pct(avg_pass) if results else "neutral",
+                "formula": "mean(pass_rate) × 100 across dq_rule_run_results",
+                "details": {"result_rows": len(results)},
             },
         ],
         "explainability": {
-            "overview": "DQ Rules metrics track rule quality — how many are active, AI-recommended, and actually being executed.",
-            "improvement": "Trigger rule evaluation runs from the main app. Review AI-suggested rules and activate relevant ones.",
+            "overview": "DQ Rules metrics track rule quality — how many are active and how well they perform when executed.",
+            "improvement": "Trigger rule evaluation runs from the main app. Review rules and ensure they have Active status.",
             "low_success_rate": "dq_rule_runs is empty — no rule evaluation jobs have been run yet. Start one from the DQ Engine tab.",
         },
     }
 
 
 def _tab_monitoring() -> Dict:
-    runs  = _query("SELECT * FROM profiling_runs ORDER BY created_at DESC LIMIT 200")
-    drift = _query("SELECT * FROM drift_records LIMIT 500")
+    # FIXED: status uppercase, no severity on drift_records
+    runs  = _query("SELECT id, status, duration_ms, timestamp FROM profiling_runs ORDER BY timestamp DESC LIMIT 200")
+    # FIXED: drift_records has drift_score and drift_type (no severity column)
+    drift = _query("SELECT id, drift_score, drift_type, profiling_run_id FROM drift_records LIMIT 500")
     total = len(runs)
-    completed = [r for r in runs if r.get("status") == "completed"]
+    completed = [r for r in runs if str(r.get("status", "")).upper() == "COMPLETED"]
 
     uptime = round(len(completed) / total * 100, 1) if total else 0.0
 
-    # Drift precision: records with meaningful severity
-    significant = [d for d in drift if str(d.get("severity","")).upper() in ("HIGH","CRITICAL","MEDIUM")]
-    precision = round(len(significant) / len(drift) * 100, 1) if drift else 0.0
+    # Drift precision: high drift_score (>=0.5) as signal of meaningful drift
+    significant = [d for d in drift if float(d.get("drift_score") or 0) >= 0.5]
+    precision   = round(len(significant) / len(drift) * 100, 1) if drift else 0.0
 
-    # Volatility: std dev of health scores from quality_snapshots
-    snaps = _query("SELECT overall_score, score FROM quality_snapshots ORDER BY created_at DESC LIMIT 20")
+    # Volatility: std dev of quality scores
+    snaps = _query("SELECT score FROM quality_snapshots ORDER BY snap_date DESC LIMIT 20")
     vals  = []
     for s in snaps:
-        v = s.get("overall_score") or s.get("score")
+        v = s.get("score")
         if v is not None:
             try: vals.append(float(v))
             except Exception: pass
     if len(vals) >= 2:
-        mean_v = sum(vals) / len(vals)
-        std_v  = (sum((x - mean_v) ** 2 for x in vals) / len(vals)) ** 0.5
+        mean_v    = sum(vals) / len(vals)
+        std_v     = (sum((x - mean_v) ** 2 for x in vals) / len(vals)) ** 0.5
         volatility = round(std_v, 1)
     else:
         volatility = 0.0
@@ -486,16 +505,16 @@ def _tab_monitoring() -> Dict:
                 "value": uptime,
                 "unit": "%",
                 "status": _pct(uptime),
-                "formula": "completed_runs / total_runs × 100",
+                "formula": "COMPLETED_runs / total_runs × 100",
                 "details": {"completed": len(completed), "total": total},
             },
             {
                 "id": "drift_detection_precision",
-                "label": "Drift Alert Precision",
+                "label": "High-Drift Alert Rate",
                 "value": precision,
                 "unit": "%",
                 "status": _pct(precision) if drift else "neutral",
-                "formula": "MEDIUM/HIGH/CRITICAL drift_records / total_drift_records × 100",
+                "formula": "drift_records_with_drift_score >= 0.5 / total_drift_records × 100",
                 "details": {"significant": len(significant), "total": len(drift)},
             },
             {
@@ -504,37 +523,35 @@ def _tab_monitoring() -> Dict:
                 "value": volatility,
                 "unit": "pts std",
                 "status": "healthy" if volatility < 5 else "warning" if volatility < 15 else "critical",
-                "formula": "stddev(quality_snapshots.overall_score) — lower = more stable",
+                "formula": "stddev(quality_snapshots.score) — lower = more stable",
                 "details": {"samples": len(vals)},
             },
         ],
         "explainability": {
             "overview": "Monitoring metrics reflect profiling consistency, drift signal quality, and health score stability over time.",
             "improvement": "Schedule profiling runs at regular intervals. High volatility means data quality is changing rapidly.",
-            "high_drift": "208 drift records exist — review them in the main app's Monitoring tab to identify which datasets are drifting.",
+            "high_drift": f"{len(drift)} drift records exist — review them in the main app's Monitoring tab.",
         },
     }
 
 
 def _tab_anomalies() -> Dict:
-    """
-    No anomalies table. Use temporal_checks as the closest equivalent —
-    these are AI-generated checks that flag data quality issues.
-    """
-    checks  = _query("SELECT * FROM temporal_checks LIMIT 500")
+    # FIXED: temporal_checks (aliased QualityCheck) has status="open"|"resolved", severity, llm_root_cause
+    # No is_anomaly field; "open" = unresolved issue; severity column exists
+    checks  = _query("SELECT id, status, severity, description, llm_root_cause, llm_remediation FROM temporal_checks LIMIT 500")
     total   = len(checks)
-    flagged = [c for c in checks if c.get("status") in ("failed","error","anomaly") or c.get("is_anomaly")]
-    passed  = [c for c in checks if c.get("status") in ("passed","ok")]
+    # open = anomaly/issue not yet resolved
+    flagged = [c for c in checks if str(c.get("status", "")).lower() == "open"]
+    resolved = [c for c in checks if str(c.get("status", "")).lower() == "resolved"]
 
     precision = round(len(flagged) / total * 100, 1) if total else 0.0
 
-    # RCA proxy: flagged checks with an explanation/reason field
-    rca_attempts = [c for c in flagged if c.get("explanation") or c.get("reason") or c.get("details")]
-    rca_bad      = [c for c in rca_attempts if len(str(c.get("explanation") or c.get("reason") or "")) < 20]
+    # RCA quality: open checks with llm_root_cause
+    rca_attempts = [c for c in flagged if c.get("llm_root_cause")]
+    rca_bad      = [c for c in rca_attempts if len(str(c.get("llm_root_cause") or "")) < 20]
     rca_hall     = round(len(rca_bad) / len(rca_attempts) * 100, 1) if rca_attempts else 0.0
 
-    # Use dq_rule_run_results for recall
-    results   = _query("SELECT * FROM dq_rule_run_results LIMIT 500")
+    results   = _query("SELECT id, pass_rate FROM dq_rule_run_results LIMIT 500")
     n_results = len(results)
     recall    = round(len(flagged) / n_results * 100, 1) if n_results else (100.0 if not flagged else 0.0)
     recall    = min(100.0, recall)
@@ -544,12 +561,12 @@ def _tab_anomalies() -> Dict:
         "metrics": [
             {
                 "id": "anomaly_precision",
-                "label": "Temporal Check Anomaly Rate",
+                "label": "Open Temporal Check Rate",
                 "value": precision,
                 "unit": "%",
                 "status": _status(100 - precision, 70, 50) if total else "neutral",
-                "formula": "failed_temporal_checks / total_temporal_checks × 100",
-                "details": {"flagged": len(flagged), "total": total, "passed": len(passed)},
+                "formula": "open_temporal_checks / total_temporal_checks × 100",
+                "details": {"open": len(flagged), "resolved": len(resolved), "total": total},
             },
             {
                 "id": "anomaly_recall",
@@ -557,7 +574,7 @@ def _tab_anomalies() -> Dict:
                 "value": recall,
                 "unit": "%",
                 "status": _pct(recall) if n_results else "neutral",
-                "formula": "flagged_checks / total_rule_results × 100",
+                "formula": "open_checks / total_rule_results × 100",
                 "details": {"flagged": len(flagged), "rule_results": n_results},
             },
             {
@@ -566,36 +583,46 @@ def _tab_anomalies() -> Dict:
                 "value": round(100 - rca_hall, 1),
                 "unit": "%",
                 "status": _pct(100 - rca_hall) if rca_attempts else "neutral",
-                "formula": "checks_with_meaningful_explanation / total_rca_attempts × 100",
+                "formula": "checks_with_meaningful_llm_root_cause / total_rca_attempts × 100",
                 "details": {"good_rca": len(rca_attempts) - len(rca_bad), "attempts": len(rca_attempts)},
             },
             {
                 "id": "auto_fix_success_rate",
                 "label": "Check Resolution Rate",
-                "value": round(len(passed) / total * 100, 1) if total else 0.0,
+                "value": round(len(resolved) / total * 100, 1) if total else 0.0,
                 "unit": "%",
-                "status": _pct(round(len(passed) / total * 100, 1)) if total else "neutral",
-                "formula": "passed_temporal_checks / total_temporal_checks × 100",
-                "details": {"passed": len(passed), "total": total},
+                "status": _pct(round(len(resolved) / total * 100, 1)) if total else "neutral",
+                "formula": "resolved_temporal_checks / total_temporal_checks × 100",
+                "details": {"resolved": len(resolved), "total": total},
             },
         ],
         "explainability": {
             "overview": "Anomaly metrics use temporal_checks — AI-generated validation checks that flag statistical anomalies in dataset columns over time.",
-            "improvement": "Investigate failed temporal checks in the main app. High anomaly rates indicate volatile data pipelines.",
-            "many_critical": "Many failed temporal checks suggest systematic data quality issues. Review by dataset in the Monitoring tab.",
+            "improvement": "Investigate open temporal checks in the main app. High open rates indicate volatile data pipelines.",
+            "many_critical": "Many open temporal checks suggest systematic data quality issues. Review by dataset in the Monitoring tab.",
         },
     }
 
 
 def _tab_lineage() -> Dict:
-    edges         = _query("SELECT * FROM lineage_edges LIMIT 500")
-    total_edges   = len(edges)
-    broken        = [e for e in edges if e.get("status") == "broken" or e.get("is_stale")]
-    low_conf      = [e for e in edges if (e.get("confidence") or 1.0) < 0.5]
-    datasets_n    = int(_scalar("SELECT COUNT(*) FROM datasets"))
-    mapped_ids    = set(e.get("source_dataset_id") for e in edges) | set(e.get("target_dataset_id") for e in edges)
-    mapped_ids.discard(None)
-    coverage = round(len(mapped_ids) / datasets_n * 100, 1) if datasets_n else 0.0
+    # FIXED: lineage_edges has source/target as strings (dataset names), not source_dataset_id/target_dataset_id
+    edges       = _query("SELECT id, source, target FROM lineage_edges LIMIT 500")
+    total_edges = len(edges)
+    datasets_n  = int(_scalar("SELECT COUNT(*) FROM datasets"))
+
+    # Map dataset names to IDs
+    ds_rows       = _query("SELECT id, display_name, physical_name FROM datasets")
+    name_set      = set()
+    for d in ds_rows:
+        if d.get("display_name"): name_set.add(str(d["display_name"]).lower())
+        if d.get("physical_name"): name_set.add(str(d["physical_name"]).lower())
+
+    # Check which edges reference known datasets
+    mapped_sources = set(str(e["source"]).lower() for e in edges if e.get("source"))
+    mapped_targets = set(str(e["target"]).lower() for e in edges if e.get("target"))
+    mapped = mapped_sources | mapped_targets
+    known  = mapped & name_set
+    coverage = round(len(known) / datasets_n * 100, 1) if datasets_n else 0.0
 
     return {
         "tab": "Data Lineage & Impact",
@@ -606,51 +633,51 @@ def _tab_lineage() -> Dict:
                 "value": coverage,
                 "unit": "%",
                 "status": _pct(coverage) if datasets_n else "neutral",
-                "formula": "datasets_with_lineage_edges / total_datasets × 100",
-                "details": {"mapped": len(mapped_ids), "total": datasets_n, "edges": total_edges},
+                "formula": "known_dataset_names_in_lineage_edges / total_datasets × 100",
+                "details": {"known": len(known), "total_datasets": datasets_n, "edges": total_edges},
             },
             {
                 "id": "broken_edge_count",
-                "label": "Broken Lineage Edges",
-                "value": len(broken),
+                "label": "Unknown Source/Target Names",
+                "value": len(mapped - name_set),
                 "unit": "",
-                "status": "healthy" if not broken else "warning" if len(broken) < 5 else "critical",
-                "formula": "COUNT(lineage_edges WHERE status='broken' OR is_stale=true)",
-                "details": {"broken": len(broken), "total": total_edges},
+                "status": "healthy" if not (mapped - name_set) else "warning",
+                "formula": "lineage edge endpoints not matching any known dataset name",
+                "details": {"unknown": len(mapped - name_set), "total_edges": total_edges},
             },
             {
                 "id": "missed_dependency_rate",
-                "label": "Low-Confidence Dependency Rate",
-                "value": round(len(low_conf) / total_edges * 100, 1) if total_edges else 0.0,
+                "label": "Datasets Without Lineage",
+                "value": round((datasets_n - len(known)) / datasets_n * 100, 1) if datasets_n else 0.0,
                 "unit": "%",
-                "status": _pct(100 - len(low_conf) / total_edges * 100) if total_edges else "neutral",
-                "formula": "edges_with_confidence < 0.5 / total_edges × 100",
-                "details": {"low_confidence": len(low_conf), "total": total_edges},
+                "status": _pct(coverage) if datasets_n else "neutral",
+                "formula": "(total_datasets - datasets_with_lineage) / total_datasets × 100",
+                "details": {"without_lineage": datasets_n - len(known), "total": datasets_n},
             },
         ],
         "explainability": {
-            "overview": "Lineage metrics track how completely upstream/downstream dataset relationships are mapped.",
-            "improvement": "Lineage edges are auto-detected during profiling. Run profiling on all 10 datasets to build the lineage graph.",
-            "low_coverage": "0 lineage edges currently — profiling runs haven't generated lineage data yet. Check if the lineage engine is enabled.",
+            "overview": "Lineage metrics track how completely upstream/downstream dataset relationships are mapped in lineage_edges.",
+            "improvement": "Create lineage edges from the Lineage tab in the main app. Run profiling on all 10 datasets first.",
+            "low_coverage": f"{total_edges} lineage edges found. lineage_edges stores source/target as dataset name strings.",
         },
     }
 
 
 def _tab_kg() -> Dict:
-    """knowledge_graph_edges table exists (0 rows). No kg_nodes table."""
-    edges      = _query("SELECT * FROM knowledge_graph_edges LIMIT 1000")
-    total      = len(edges)
-    high_conf  = [e for e in edges if float(e.get("confidence") or e.get("weight") or 0) >= 0.7]
-    null_conf  = [e for e in edges if e.get("confidence") is None and e.get("weight") is None]
+    # KnowledgeGraphEdge columns: confidence, relationship_type, source_column, target_column, invalidated
+    edges     = _query("SELECT id, confidence, relationship_type, source_column, target_column, invalidated FROM knowledge_graph_edges LIMIT 1000")
+    total     = len(edges)
+    high_conf = [e for e in edges if float(e.get("confidence") or 0) >= 0.7]
+    null_conf = [e for e in edges if e.get("confidence") is None]
+    invalid   = [e for e in edges if e.get("invalidated")]
 
     precision  = round(len(high_conf) / total * 100, 1) if total else 0.0
     hall_rate  = round(len(null_conf) / total * 100, 1) if total else 0.0
 
-    # Column mapping: edges where edge_type involves column relationships
-    col_edges  = [e for e in edges if str(e.get("edge_type","")).lower() in
-                  ("similar_to","references","maps_to","column_similarity","related_to")]
-    # Count distinct column references from column_profiles
-    total_cols = int(_scalar("SELECT COUNT(DISTINCT column_name) FROM column_profiles"))
+    # Column mapping coverage
+    total_cols  = int(_scalar("SELECT COUNT(DISTINCT column_name) FROM column_profiles"))
+    col_edges   = set(e.get("source_column") for e in edges if e.get("source_column")) | \
+                  set(e.get("target_column") for e in edges if e.get("target_column"))
     mapping_acc = round(len(col_edges) / total_cols * 100, 1) if total_cols else 0.0
     mapping_acc = min(100.0, mapping_acc)
 
@@ -663,7 +690,7 @@ def _tab_kg() -> Dict:
                 "value": precision,
                 "unit": "%",
                 "status": _pct(precision) if total else "neutral",
-                "formula": "knowledge_graph_edges_with_confidence ≥ 0.7 / total_edges × 100",
+                "formula": "knowledge_graph_edges_with_confidence >= 0.7 / total_edges × 100",
                 "details": {"high_confidence": len(high_conf), "total": total},
             },
             {
@@ -672,7 +699,7 @@ def _tab_kg() -> Dict:
                 "value": mapping_acc,
                 "unit": "%",
                 "status": _pct(mapping_acc) if total else "neutral",
-                "formula": "column_relationship_edges / distinct_columns_in_profiles × 100",
+                "formula": "distinct_columns_in_kg_edges / distinct_columns_in_profiles × 100",
                 "details": {"col_edges": len(col_edges), "distinct_cols": total_cols},
             },
             {
@@ -694,24 +721,22 @@ def _tab_kg() -> Dict:
 
 
 def _tab_assistant() -> Dict:
-    """
-    No llm_interactions table. Derive from notification_inbox (AI-generated
-    notifications) and governance_notifications as proxy for agent activity.
-    """
-    inbox    = _query("SELECT * FROM notification_inbox LIMIT 500")
-    gov_notif = _query("SELECT * FROM governance_notifications LIMIT 200")
-    total    = len(inbox) + len(gov_notif)
+    # NotificationInbox: type, category, message, dataset_id, severity
+    inbox     = _query("SELECT id, type, category, message, dataset_id, severity FROM notification_inbox LIMIT 500")
+    # GovernanceNotification: title, description, enabled, channel
+    gov_notif = _query("SELECT id, title, description, enabled, channel FROM governance_notifications LIMIT 200")
+    total     = len(inbox) + len(gov_notif)
 
-    # Routing accuracy: notifications with a category/type tag (agent correctly categorised)
-    tagged   = [n for n in inbox if n.get("type") or n.get("category") or n.get("notification_type")]
+    # Routing accuracy: inbox notifications with a type set
+    tagged   = [n for n in inbox if n.get("type") and n["type"] != "ALERT"]  # non-default type = properly routed
     routing  = round(len(tagged) / len(inbox) * 100, 1) if inbox else 0.0
 
-    # Hallucination: notifications with empty or very short message
-    bad_msg  = [n for n in inbox if not n.get("message") or len(str(n.get("message",""))) < 15]
-    hall_rate = round(len(bad_msg) / len(inbox) * 100, 1) if inbox else 0.0
+    # Quality: notifications with meaningful message (>15 chars)
+    good_msg  = [n for n in inbox if n.get("message") and len(str(n["message"])) >= 15]
+    hall_rate = round((len(inbox) - len(good_msg)) / len(inbox) * 100, 1) if inbox else 0.0
 
-    # Grounding: notifications referencing a dataset_id or entity
-    grounded = [n for n in inbox if n.get("dataset_id") or n.get("entity_id") or n.get("run_id")]
+    # Grounding: notifications referencing a dataset
+    grounded  = [n for n in inbox if n.get("dataset_id")]
     grounding = round(len(grounded) / len(inbox) * 100, 1) if inbox else 0.0
 
     return {
@@ -719,12 +744,12 @@ def _tab_assistant() -> Dict:
         "metrics": [
             {
                 "id": "agent_routing_accuracy",
-                "label": "Notification Routing Accuracy",
+                "label": "Notification Type Distribution",
                 "value": routing,
                 "unit": "%",
                 "status": _pct(routing) if inbox else "neutral",
-                "formula": "notifications_with_type_tag / total_notifications × 100",
-                "details": {"tagged": len(tagged), "total": len(inbox)},
+                "formula": "notifications_with_non-default_type / total × 100",
+                "details": {"typed": len(tagged), "total": len(inbox)},
             },
             {
                 "id": "assistant_hallucination_rate",
@@ -732,8 +757,8 @@ def _tab_assistant() -> Dict:
                 "value": round(100 - hall_rate, 1),
                 "unit": "%",
                 "status": _pct(100 - hall_rate) if inbox else "neutral",
-                "formula": "notifications_with_meaningful_message / total × 100",
-                "details": {"good": len(inbox) - len(bad_msg), "total": len(inbox)},
+                "formula": "notifications_with_message_length >= 15 / total × 100",
+                "details": {"good": len(good_msg), "total": len(inbox)},
             },
             {
                 "id": "action_agent_success_rate",
@@ -741,7 +766,7 @@ def _tab_assistant() -> Dict:
                 "value": round(len(gov_notif) / max(total, 1) * 100, 1),
                 "unit": "%",
                 "status": _pct(round(len(gov_notif) / max(total, 1) * 100, 1)) if total else "neutral",
-                "formula": "governance_notifications / total_agent_notifications × 100",
+                "formula": "governance_notifications / total_notifications × 100",
                 "details": {"governance": len(gov_notif), "total": total},
             },
             {
@@ -750,7 +775,7 @@ def _tab_assistant() -> Dict:
                 "value": grounding,
                 "unit": "%",
                 "status": _pct(grounding) if inbox else "neutral",
-                "formula": "notifications_referencing_dataset_or_entity / total × 100",
+                "formula": "inbox_notifications_with_dataset_id / total × 100",
                 "details": {"grounded": len(grounded), "total": len(inbox)},
             },
         ],
@@ -763,25 +788,27 @@ def _tab_assistant() -> Dict:
 
 
 def _tab_governance() -> Dict:
-    policies = _query("SELECT * FROM governance_policies LIMIT 200")
+    # FIXED: GovernancePolicy has status field (no is_active/enabled/source)
+    # Active status check: status = "Active" (capitalised)
+    policies = _query("SELECT id, name, status, policy_type FROM governance_policies LIMIT 200")
     total    = len(policies)
-    active   = [p for p in policies if p.get("is_active") or p.get("status") == "active" or p.get("enabled")]
-    ai_pol   = [p for p in policies if str(p.get("source","")).lower() in ("llm","ai","suggested","generated")]
-    accepted = [p for p in ai_pol if p.get("is_active") or p.get("enabled")]
-    adopt    = round(len(accepted) / len(ai_pol) * 100, 1) if ai_pol else 0.0
+    active   = [p for p in policies if str(p.get("status", "")).lower() == "active"]
 
-    # Classification: column_profiles with a sensitivity_label or data_type classified
+    # Classification: column_profiles with non-null sensitivity data
     classified = int(_scalar(
-        "SELECT COUNT(*) FROM column_profiles WHERE sensitivity_label IS NOT NULL AND sensitivity_label != ''"
+        "SELECT COUNT(*) FROM column_profiles WHERE data_type IS NOT NULL AND data_type != ''"
     ))
     total_cols = int(_scalar("SELECT COUNT(*) FROM column_profiles"))
     class_acc  = round(classified / total_cols * 100, 1) if total_cols else 0.0
 
     # Audit log
-    audit_n = int(_scalar("SELECT COUNT(*) FROM governance_audit_log"))
+    audit_n  = int(_scalar("SELECT COUNT(*) FROM governance_audit_log"))
     action_n = int(_scalar("SELECT COUNT(*) FROM profiling_runs")) + int(_scalar("SELECT COUNT(*) FROM dq_rules"))
     audit_c  = round(audit_n / action_n * 100, 1) if action_n else 0.0
     audit_c  = min(100.0, audit_c)
+
+    # Policy adoption = active / total
+    adopt = round(len(active) / total * 100, 1) if total else 0.0
 
     return {
         "tab": "Governance & Settings",
@@ -791,17 +818,17 @@ def _tab_governance() -> Dict:
                 "label": "Policy Adoption Rate",
                 "value": adopt,
                 "unit": "%",
-                "status": _pct(adopt) if ai_pol else "neutral",
-                "formula": "active_ai_policies / total_ai_suggested_policies × 100",
-                "details": {"accepted": len(accepted), "suggested": len(ai_pol), "total": total},
+                "status": _pct(adopt) if total else "neutral",
+                "formula": "active_governance_policies / total_policies × 100",
+                "details": {"active": len(active), "total": total},
             },
             {
                 "id": "classification_accuracy",
-                "label": "Column Sensitivity Classification",
+                "label": "Column Type Classification",
                 "value": class_acc,
                 "unit": "%",
                 "status": _pct(class_acc) if total_cols else "neutral",
-                "formula": "column_profiles_with_sensitivity_label / total_column_profiles × 100",
+                "formula": "column_profiles_with_data_type / total_column_profiles × 100",
                 "details": {"classified": classified, "total": total_cols},
             },
             {
@@ -815,27 +842,28 @@ def _tab_governance() -> Dict:
             },
         ],
         "explainability": {
-            "overview": "Governance metrics track policy adoption, data sensitivity classification, and audit trail completeness.",
-            "improvement": "Classify column sensitivity in the Governance tab. Review AI policy suggestions and activate relevant ones.",
-            "low_adoption": "Only 1 governance policy exists. Use the Governance tab to generate and review AI policy suggestions.",
+            "overview": "Governance metrics track policy adoption, data type classification, and audit trail completeness.",
+            "improvement": "Classify column types in the Governance tab. Review and activate governance policies.",
+            "low_adoption": f"Only {total} governance policy/policies. Use the Governance tab to create and activate policies.",
         },
     }
 
 
 def _tab_system() -> Dict:
-    runs      = _query("SELECT * FROM profiling_runs ORDER BY created_at DESC LIMIT 200")
-    completed = [r for r in runs if r.get("status") == "completed"]
-    failed    = [r for r in runs if r.get("status") == "failed"]
+    # FIXED: status uppercase, use duration_ms, use timestamp
+    runs      = _query("SELECT id, status, duration_ms, timestamp FROM profiling_runs ORDER BY timestamp DESC LIMIT 200")
+    completed = [r for r in runs if str(r.get("status", "")).upper() == "COMPLETED"]
+    failed    = [r for r in runs if str(r.get("status", "")).upper() == "FAILED"]
     total     = len(runs)
 
     uptime = round(len(completed) / (len(completed) + len(failed)) * 100, 1) if (completed or failed) else 100.0
 
-    # Throughput: runs per hour
+    # Throughput: runs per hour over time range
     if total >= 2:
-        sorted_r = sorted([r for r in runs if r.get("created_at")], key=lambda x: str(x["created_at"]))
+        sorted_r = sorted([r for r in runs if r.get("timestamp")], key=lambda x: str(x["timestamp"]))
         try:
-            t0 = datetime.fromisoformat(str(sorted_r[0]["created_at"]).replace("Z","+00:00").replace(" ","T"))
-            t1 = datetime.fromisoformat(str(sorted_r[-1]["created_at"]).replace("Z","+00:00").replace(" ","T"))
+            t0 = datetime.fromisoformat(str(sorted_r[0]["timestamp"]).replace("Z", "+00:00").replace(" ", "T"))
+            t1 = datetime.fromisoformat(str(sorted_r[-1]["timestamp"]).replace("Z", "+00:00").replace(" ", "T"))
             hours = max(1, (t1 - t0).total_seconds() / 3600)
             throughput = round(total / hours, 2)
         except Exception:
@@ -843,18 +871,9 @@ def _tab_system() -> Dict:
     else:
         throughput = 0.0
 
-    # Avg runtime
-    durations = []
-    for r in completed:
-        try:
-            s = datetime.fromisoformat(str(r.get("created_at","")).replace("Z","+00:00").replace(" ","T"))
-            e = datetime.fromisoformat(str(r.get("updated_at","")).replace("Z","+00:00").replace(" ","T"))
-            ms = (e - s).total_seconds() * 1000
-            if 0 < ms < 3600000:
-                durations.append(ms)
-        except Exception:
-            pass
-    avg_ms = round(sum(durations) / len(durations)) if durations else 0
+    # Avg runtime from duration_ms
+    durations = [r["duration_ms"] for r in completed if r.get("duration_ms") and r["duration_ms"] > 0]
+    avg_ms    = round(sum(durations) / len(durations)) if durations else 0
 
     return {
         "tab": "System / Platform",
@@ -865,7 +884,7 @@ def _tab_system() -> Dict:
                 "value": uptime,
                 "unit": "%",
                 "status": _pct(uptime),
-                "formula": "completed_runs / (completed + failed) × 100",
+                "formula": "COMPLETED_runs / (completed + failed) × 100",
                 "details": {"completed": len(completed), "failed": len(failed), "total": total},
             },
             {
@@ -883,40 +902,38 @@ def _tab_system() -> Dict:
                 "value": avg_ms,
                 "unit": "ms",
                 "status": "healthy" if avg_ms < 60000 else "warning" if avg_ms < 300000 else "critical",
-                "formula": "mean(updated_at - created_at) in ms across completed runs",
+                "formula": "mean(duration_ms) across completed runs",
                 "details": {"samples": len(durations)},
             },
         ],
         "explainability": {
             "overview": "System metrics reflect platform reliability and processing throughput based on profiling run history.",
-            "improvement": "35 profiling runs recorded. Monitor failed runs in Render logs. High job duration means large datasets.",
-            "low_success_rate": "Failed runs appear in the profiling_runs table with status='failed'. Check data source credentials.",
+            "improvement": f"{total} profiling runs recorded. Monitor failed runs in Render logs.",
+            "low_success_rate": "Failed runs appear in profiling_runs with status='FAILED'. Check data source credentials.",
         },
     }
 
 
 def _tab_feedback() -> Dict:
-    # governance_dismissed_suggestions = analyst explicitly dismissed → inverse of acceptance
-    dismissed = int(_scalar("SELECT COUNT(*) FROM governance_dismissed_suggestions"))
-    total_pol  = int(_scalar("SELECT COUNT(*) FROM governance_policies"))
-    # Accepted = total policies that are active
+    # FIXED: governance_dismissed_suggestions only has 'id' column
+    dismissed  = int(_scalar("SELECT COUNT(*) FROM governance_dismissed_suggestions"))
+    # FIXED: governance_policies.status (no is_active)
     active_pol = int(_scalar(
-        "SELECT COUNT(*) FROM governance_policies WHERE is_active = 1 OR status = 'active'"
+        "SELECT COUNT(*) FROM governance_policies WHERE LOWER(status) = 'active'"
     ))
     total_suggestions = dismissed + active_pol
     accept_rate = round(active_pol / total_suggestions * 100, 1) if total_suggestions else 0.0
 
-    # Satisfaction proxy: governance_audit_log actions (more actions = more engagement)
+    # Satisfaction proxy: governance_audit_log actions
     audit_actions = int(_scalar("SELECT COUNT(*) FROM governance_audit_log"))
-    # Scale: 0 actions = 0, 10+ actions = 100
-    satisfaction = round(min(100.0, audit_actions / 10 * 100), 1)
+    satisfaction  = round(min(100.0, audit_actions / 10 * 100), 1)
 
     return {
         "tab": "Human Feedback",
         "metrics": [
             {
                 "id": "ai_acceptance_rate",
-                "label": "AI Suggestion Acceptance Rate",
+                "label": "Policy Acceptance Rate",
                 "value": accept_rate,
                 "unit": "%",
                 "status": _pct(accept_rate) if total_suggestions else "neutral",
@@ -936,7 +953,7 @@ def _tab_feedback() -> Dict:
         "explainability": {
             "overview": "Human Feedback uses governance policy acceptance and audit log activity as proxies for analyst engagement.",
             "improvement": "Encourage analysts to review and accept/dismiss AI policy suggestions. More audit log activity = higher engagement score.",
-            "low_satisfaction": "3 audit log entries recorded. More active use of Governance, DQ Rules, and Policy features increases this score.",
+            "low_satisfaction": f"{audit_actions} audit log entries. More active use of Governance, DQ Rules, and Policy features increases this score.",
         },
     }
 
@@ -947,7 +964,6 @@ def _tab_feedback() -> Dict:
 @router.get("")
 def get_all_metrics(dataset_id: Optional[int] = Query(None)):
     """Compute and return all health metric tabs from live DB data."""
-    # Determine DB path for response metadata
     db_path = "unknown"
     try:
         from app.database import engine
