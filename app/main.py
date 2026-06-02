@@ -64,21 +64,48 @@ try:
     def _bootstrap_sqlite_schema():
         try:
             with engine.connect() as conn:
+                # ── Original dq_rules columns ─────────────────────────────────
                 exists = conn.execute(
                     text("SELECT name FROM sqlite_master WHERE type='table' AND name='dq_rules'")
                 ).fetchone()
-                if not exists:
-                    return
-                cols = conn.execute(text("PRAGMA table_info(dq_rules)")).fetchall()
-                existing = {row[1] for row in cols}
-                for col, defn in [
-                    ("input_mode", "VARCHAR NOT NULL DEFAULT 'manual'"),
-                    ("nl_text",    "TEXT"),
-                    ("regex_pattern", "TEXT"),
-                    ("meta",       "JSON"),
-                ]:
-                    if col not in existing:
-                        conn.exec_driver_sql(f"ALTER TABLE dq_rules ADD COLUMN {col} {defn}")
+                if exists:
+                    cols = conn.execute(text("PRAGMA table_info(dq_rules)")).fetchall()
+                    existing = {row[1] for row in cols}
+                    for col, defn in [
+                        ("input_mode", "VARCHAR NOT NULL DEFAULT 'manual'"),
+                        ("nl_text",    "TEXT"),
+                        ("regex_pattern", "TEXT"),
+                        ("meta",       "JSON"),
+                    ]:
+                        if col not in existing:
+                            conn.exec_driver_sql(f"ALTER TABLE dq_rules ADD COLUMN {col} {defn}")
+
+                # ── ADDED: profiling_runs timing columns ──────────────────────
+                # Required by health_metrics_router to compute:
+                #   avg_llm_latency_ms, avg_profiling_runtime_s,
+                #   avg_job_duration_ms, api_throughput
+                # Without these, all timing metrics remain 0.
+                pr_exists = conn.execute(
+                    text("SELECT name FROM sqlite_master WHERE type='table' AND name='profiling_runs'")
+                ).fetchone()
+                if pr_exists:
+                    pr_cols = conn.execute(text("PRAGMA table_info(profiling_runs)")).fetchall()
+                    pr_existing = {row[1] for row in pr_cols}
+                    for col, defn in [
+                        ("started_at",   "TEXT"),        # ISO-8601 UTC timestamp
+                        ("completed_at", "TEXT"),        # ISO-8601 UTC timestamp
+                        ("duration_ms",  "INTEGER"),     # explicit ms if tracked directly
+                    ]:
+                        if col not in pr_existing:
+                            try:
+                                conn.exec_driver_sql(
+                                    f"ALTER TABLE profiling_runs ADD COLUMN {col} {defn}"
+                                )
+                                print(f"[bootstrap] Added column profiling_runs.{col}")
+                            except Exception as col_err:
+                                # Column may already exist in some environments
+                                _STARTUP_ERRORS.append(f"add_col_{col}: {col_err}")
+
                 conn.commit()
         except Exception as e:
             _STARTUP_ERRORS.append(f"schema_bootstrap: {e}")
@@ -92,11 +119,95 @@ try:
         start_periodic_backup(interval_seconds=300)
     except Exception as e:
         _STARTUP_ERRORS.append(f"periodic_backup: {e}")
+
+    # ── ADDED: Extract real DB path from SQLAlchemy engine URL ───────────────
+    # health_metrics_router uses raw sqlite3 + DB_PATH env var.
+    # We extract the path here so both layers always point to the same file,
+    # regardless of what DATABASE_URL is set to in Render.
+    try:
+        _db_url = str(engine.url)
+        if _db_url.startswith("sqlite:////"):
+            # Four slashes = absolute path on Unix: sqlite:////tmp/...
+            _db_path = "/" + _db_url[len("sqlite:////"):]
+        elif _db_url.startswith("sqlite:///"):
+            # Three slashes = relative path
+            _db_path = _db_url[len("sqlite:///"):]
+        else:
+            _db_path = "/tmp/ai-dqm/ai_dqm.db"  # safe fallback
+
+        os.environ["DB_PATH"] = _db_path
+        print(f"[startup] DB_PATH set to: {_db_path}")
+    except Exception as e:
+        # Fallback: use the default path the router already knows about
+        os.environ.setdefault("DB_PATH", "/tmp/ai-dqm/ai_dqm.db")
+        _STARTUP_ERRORS.append(f"db_path_extract: {e}")
+
     print("[startup] DB bootstrap complete")
+
 except Exception as e:
     msg = f"DB bootstrap FAILED: {e}"
     _STARTUP_ERRORS.append(msg)
     print(f"[startup] WARNING: {msg}")
+    # Still set a default DB_PATH so the health-metrics router can attempt to connect
+    os.environ.setdefault("DB_PATH", "/tmp/ai-dqm/ai_dqm.db")
+
+
+# ── ADDED: LLM client factory (Azure AI Foundry — Llama 3.3 70B) ─────────────
+# Replaces any AzureOpenAI client initialization scattered through profiling code.
+# Import this wherever you make LLM calls:
+#
+#   from app.main import get_llm_client
+#   client = get_llm_client()
+#   if client:
+#       response = client.chat.completions.create(
+#           model=os.getenv("AZURE_OPENAI_DEPLOYMENT", "Llama-3.3-70B-Instruct"),
+#           messages=[{"role": "user", "content": prompt}],
+#           max_tokens=500,
+#       )
+#
+# WHY THIS FIX:
+#   AzureOpenAI constructs URLs as:
+#     {endpoint}/openai/deployments/{model}/chat/completions?api-version=xxx
+#   This returns 404 for Llama models on Azure AI Foundry.
+#   Foundry uses the OpenAI-compatible path:
+#     {endpoint}/v1/chat/completions   (no api-version, Bearer auth)
+#
+_llm_client_instance = None
+
+def get_llm_client():
+    """
+    Returns an OpenAI-compatible client for Azure AI Foundry (Llama/non-GPT models).
+    Returns None if env vars are not configured — callers must handle None gracefully.
+    Thread-safe: client is created once and reused.
+    """
+    global _llm_client_instance
+    if _llm_client_instance is not None:
+        return _llm_client_instance
+
+    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
+    api_key  = os.getenv("AZURE_OPENAI_API_KEY",  "")
+
+    if not endpoint or not api_key:
+        print("[llm] WARNING: AZURE_OPENAI_ENDPOINT or AZURE_OPENAI_API_KEY not set — LLM disabled")
+        return None
+
+    try:
+        from openai import OpenAI
+        _llm_client_instance = OpenAI(
+            base_url=f"{endpoint}/v1",  # ← Foundry path, NOT /openai/deployments/
+            api_key=api_key,            # ← sent as Bearer token automatically
+        )
+        print(f"[llm] Client initialised → {endpoint}/v1")
+        return _llm_client_instance
+    except Exception as e:
+        _STARTUP_ERRORS.append(f"llm_client_init: {e}")
+        print(f"[llm] ERROR initialising client: {e}")
+        return None
+
+
+# Eagerly attempt client creation at startup so any misconfiguration
+# is logged immediately rather than silently at first LLM call.
+get_llm_client()
 
 
 # ── Router loader helper ──────────────────────────────────────────────────────
@@ -233,6 +344,10 @@ def _start_scheduler():
 _load("profiling_scheduler", _start_scheduler)
 
 # ── Health Metrics Router ─────────────────────────────────────────────────────
+# Registers GET /api/health-metrics
+# No prefix — the router already defines the full /api/health-metrics path.
+# DB_PATH is set above from the SQLAlchemy engine URL so the router's
+# raw sqlite3 connection hits the same database file.
 def _reg_health_metrics():
     from app.routers.health_metrics_router import router as hm_router
     app.include_router(hm_router)
