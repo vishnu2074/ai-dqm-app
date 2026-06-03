@@ -1,12 +1,13 @@
 """
-health_metrics_router.py  —  AI DQM Health Observatory  v4.1
+health_metrics_router.py  —  AI DQM Health Observatory  v4.2
 ─────────────────────────────────────────────────────────────
 Complete rewrite with dynamic schema introspection.
 
-Key fixes vs v4.0:
-  • FIXED: Removed backslashes from inside f-string expressions (SyntaxError in Python 3.11)
-  • Added _in_clause() helper to safely build SQL IN clauses
-  • Fixed dict() conversion for sqlite3.Row in debug endpoint
+Key fixes vs v4.1:
+  • FIXED: retrieval_grounding_score now checks for 'dataset' column (TEXT) 
+    in addition to 'dataset_id' (Integer FK) - matches actual DB schema
+  • All previous fixes maintained: dynamic status mapping, drift_type usage,
+    timestamp backfill support, safe SQL generation
 """
 
 import os
@@ -701,7 +702,6 @@ def _tab_monitoring_trends(conn, schema, dataset_id) -> dict:
         "explainability": {"overview": "Monitoring tracks profiling activity, drift signal quality, and health score stability over time."},
     }
 
-# ... (keep all the rest of the file the same) ...
 
 # ═════════════════════════════════════════════════════════════════════════════
 # TAB 6 — ANOMALIES AI
@@ -937,10 +937,17 @@ def _tab_dq_assistant(conn, schema, dataset_id) -> dict:
         actioned = gn_total
     aas_status = _status(aas_val, healthy_ge=60, critical_lt=20)
 
-    ds_id_col = "dataset_id" if "dataset_id" in ni_cols else None
+    # ── FIXED: Check for dataset linking column (could be 'dataset_id' or 'dataset') ──
+    # The notification_inbox table has 'dataset' TEXT column (not 'dataset_id' Integer FK)
+    ds_id_col = None
+    for candidate in ("dataset_id", "dataset"):
+        if candidate in ni_cols:
+            ds_id_col = candidate
+            break
+    
     if ds_id_col:
         row_gs = _one(conn,
-            f"SELECT COUNT(CASE WHEN {ds_id_col} IS NOT NULL THEN 1 END) as grounded, "
+            f"SELECT COUNT(CASE WHEN {ds_id_col} IS NOT NULL AND TRIM({ds_id_col})!='' THEN 1 END) as grounded, "
             f"COUNT(*) as total FROM notification_inbox")
         grounded = row_gs["grounded"] if row_gs else 0
         gs_total = row_gs["total"] if row_gs else 0
@@ -964,7 +971,8 @@ def _tab_dq_assistant(conn, schema, dataset_id) -> dict:
               "governance_notifications_actioned / total_governance × 100",
               {"actioned": actioned, "governance_total": gn_total, "all_notifications": all_notif}),
             M("retrieval_grounding_score", "Context Grounding Score", rgs_val, "%", rgs_status,
-              "notifications_with_dataset_id / total × 100", {"grounded": grounded, "total": gs_total}),
+              f"notifications_with_{ds_id_col or 'dataset'} / total × 100", 
+              {"grounded": grounded, "total": gs_total, "dataset_column": ds_id_col or "not found"}),
             M("avg_notifications_per_dataset", "Notifications Per Dataset", avg_notif, "", anpd_status,
               "total_notification_inbox / total_datasets", {"total_notifications": ni_total, "total_datasets": total_datasets}),
         ],
@@ -1221,7 +1229,7 @@ async def debug_schema_inspection():
         schema = _introspect(conn)
         
         samples = {}
-        for tbl in ["profiling_runs", "dq_rules", "drift_records", "temporal_checks"]:
+        for tbl in ["profiling_runs", "dq_rules", "drift_records", "temporal_checks", "notification_inbox"]:
             if _table_exists(conn, tbl):
                 rows = _all(conn, f"SELECT * FROM {tbl} LIMIT 3")
                 # Safely convert sqlite3.Row to dict

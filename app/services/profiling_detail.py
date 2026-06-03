@@ -1,15 +1,19 @@
 """
 python-backend/app/services/profiling_detail.py
 
-CHANGES:
-  1. _ai_dataset_description() — LLM generates a rich natural-language paragraph
-     about the dataset using Azure AI Foundry HTTP (same pattern as everywhere else)
+CHANGES (v2.0 — Health Observatory Integration):
+  1. _ai_dataset_description() — FIXED to use correct Azure AI Foundry auth
+     (Bearer token + /v1/chat/completions endpoint)
   2. Each column now has BOTH:
        columnType  (NEW):  specific SQL/pandas type — INTEGER, FLOAT, VARCHAR, DATE,
                            EMAIL, ENUM, UUID, TIMESTAMP, DECIMAL, TEXT etc.
        typeClass   (unchanged): generic bucket — NUMERIC | CATEGORICAL | DATETIME | STRING
        semanticType (unchanged): LLM PascalCase label — CustomerID, EmailAddress etc.
   3. description field added to payload — consumed by Data Description tab
+  4. NEW: Sensitivity classification per column (PII, Financial, Health, etc.)
+  5. NEW: AI summary saved to profiling_runs.ai_summary column
+  6. NEW: Sensitivity labels saved to column_profiles.sensitivity_label column
+  7. NEW: AI descriptions saved to column_profiles.ai_description column
 """
 from __future__ import annotations
 
@@ -81,6 +85,111 @@ _KEY      = os.getenv("AZURE_OPENAI_API_KEY", "")
 _ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
 _MODEL    = os.getenv("AZURE_OPENAI_MODEL", "Llama-3.3-70B-Instruct")
 _VERSION  = os.getenv("AZURE_OPENAI_API_VERSION", "2024-05-01-preview")
+
+
+# ─── Sensitivity Classification ──────────────────────────────────────────────
+
+_SENSITIVE_PATTERNS = {
+    "PII": re.compile(
+        r"(email|phone|mobile|cell|ssn|social.*security|passport|national.*id|"
+        r"drivers.*license|dob|birth.*date|first.*name|last.*name|full.*name)", re.I
+    ),
+    "Financial": re.compile(
+        r"(salary|income|bank.*account|credit.*card|balance|amount|price|cost|"
+        r"revenue|payment|purchase|transaction)", re.I
+    ),
+    "Health": re.compile(
+        r"(patient|diagnosis|medical|health|prescription|treatment|disease|symptom)", re.I
+    ),
+    "Authentication": re.compile(
+        r"(password|secret|token|api.*key|credential|auth)", re.I
+    ),
+    "Location": re.compile(
+        r"(address|latitude|longitude|gps|coordinates|zip.*code|postal|city|country)", re.I
+    ),
+}
+
+
+def _classify_sensitivity(col: str, type_class: str, sample_values: list) -> str:
+    """Classify column sensitivity based on name patterns and sample values."""
+    # Check column name patterns first
+    for label, pattern in _SENSITIVE_PATTERNS.items():
+        if pattern.search(col):
+            return label
+
+    # Check sample values for sensitive patterns
+    for val in sample_values[:20]:
+        val_str = str(val).strip()
+        if not val_str or val_str.lower() in ('nan', 'null', 'none', ''):
+            continue
+        if _EMAIL_RE.match(val_str):
+            return "PII"
+        if _PHONE_RE.match(val_str):
+            return "PII"
+        if _UUID_RE.match(val_str) and any(x in col.lower() for x in ('id', 'key', 'token')):
+            return "Authentication"
+
+    return "Public"
+
+
+# ─── DB Save Helpers ─────────────────────────────────────────────────────────
+
+def _save_ai_summary_to_db(run_id: int, summary: str):
+    """Save AI-generated dataset description to profiling_runs.ai_summary column."""
+    if not summary:
+        return
+    try:
+        from app.database import engine
+        from sqlalchemy import text as sa_text
+        with engine.connect() as conn:
+            conn.execute(
+                sa_text("UPDATE profiling_runs SET ai_summary = :summary WHERE id = :id"),
+                {"summary": summary, "id": run_id}
+            )
+            conn.commit()
+        print(f"[profiling] ✓ Saved AI summary for run {run_id} ({len(summary)} chars)")
+    except Exception as e:
+        print(f"[profiling] ✗ Failed to save AI summary: {e}")
+
+
+def _save_sensitivity_to_db(profiling_run_id: int, column_name: str, sensitivity: str):
+    """Save sensitivity label to column_profiles table for the given run."""
+    try:
+        from app.database import engine
+        from sqlalchemy import text as sa_text
+        with engine.connect() as conn:
+            conn.execute(
+                sa_text("""
+                    UPDATE column_profiles
+                    SET sensitivity_label = :label
+                    WHERE profiling_run_id = :run_id AND column_name = :col_name
+                """),
+                {"label": sensitivity, "run_id": profiling_run_id, "col_name": column_name}
+            )
+            conn.commit()
+    except Exception as e:
+        print(f"[profiling] ✗ Failed to save sensitivity for {column_name}: {e}")
+
+
+def _save_ai_description_to_db(profiling_run_id: int, column_name: str, description: str):
+    """Save AI-generated column description to column_profiles table."""
+    if not description:
+        return
+    try:
+        from app.database import engine
+        from sqlalchemy import text as sa_text
+        with engine.connect() as conn:
+            conn.execute(
+                sa_text("""
+                    UPDATE column_profiles
+                    SET ai_description = :desc
+                    WHERE profiling_run_id = :run_id AND column_name = :col_name
+                """),
+                {"desc": description, "run_id": profiling_run_id, "col_name": column_name}
+            )
+            conn.commit()
+    except Exception as e:
+        print(f"[profiling] ✗ Failed to save AI description for {column_name}: {e}")
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -303,55 +412,107 @@ Columns:
         return {}
 
 
-# ─── AI: dataset description (Azure AI Foundry) ──────────────────────────────
+# ─── AI: dataset description (Azure AI Foundry — FIXED) ──────────────────────
 
 def _ai_dataset_description(ds_name: str, total_rows: int, columns: list[dict], summary: dict) -> str:
     """
     LLM-generated natural language description of the dataset.
-    Falls back to a structured template if unavailable.
+    FIXED: Uses get_llm_client() from app.main with correct Bearer auth.
+    Falls back to raw HTTP with correct auth, then to structured template.
     """
-    if not _KEY or not _ENDPOINT:
-        return _fallback_description(ds_name, total_rows, columns, summary)
-
-    col_lines = []
-    for c in columns[:20]:
-        sem   = c.get("entity",{}).get("semanticType","")
-        ctype = c.get("columnType", c.get("typeClass",""))
-        col_lines.append(f"  {c['columnName']} ({ctype}, semantic={sem}, nulls={c.get('nullPct',0):.1f}%, unique={c.get('distinctPct',0):.0f}%)")
-
-    prompt = f"""You are a data catalog expert writing a detailed description for business and technical users.
-
-Dataset: "{ds_name}"
-Rows: {total_rows:,} | Columns: {len(columns)}
-Completeness: {summary.get('avgCompleteness',0):.1f}% | Uniqueness: {summary.get('avgUniqueness',0):.1f}%
-Types: {summary.get('numericColumns',0)} numeric, {summary.get('categoricalColumns',0)} categorical, {summary.get('datetimeColumns',0)} datetime, {summary.get('stringColumns',0)} string
-
-Columns:
-{chr(10).join(col_lines)}
-
-Write a professional dataset description covering:
-1. What this dataset represents and its business domain (2-3 sentences)
-2. Key entities or concepts captured (1-2 sentences)
-3. Data structure highlights — identifiers, measures, time coverage (2 sentences)
-4. Data quality characteristics — completeness, uniqueness (1-2 sentences)
-5. Suggested use cases (2-3 specific bullet points starting with •)
-
-Be specific to this dataset. No markdown headers. Plain paragraphs and bullets only."""
-
+    # ── Priority 1: Use centralized LLM client (correct auth) ────────────────
     try:
-        r = _http.post(
-            f"{_ENDPOINT}/chat/completions",
-            headers={"Content-Type":"application/json","api-key":_KEY},
-            json={"model":_MODEL,"messages":[{"role":"user","content":prompt}],"temperature":0.3,"max_tokens":600},
-            timeout=35,
-        )
-        r.raise_for_status()
-        raw = r.json()["choices"][0]["message"]["content"]
-        if raw and len(raw.strip()) > 80:
-            return raw.strip()
-    except Exception as e:
-        print(f"[profiling] AI description failed (non-fatal): {e}")
+        from app.main import get_llm_client
+        client = get_llm_client()
 
+        if client:
+            col_lines = []
+            for c in columns[:20]:
+                sem   = c.get("entity",{}).get("semanticType","")
+                ctype = c.get("columnType", c.get("typeClass",""))
+                col_lines.append(
+                    f"  {c['columnName']} ({ctype}, semantic={sem}, "
+                    f"nulls={c.get('nullPct',0):.1f}%, unique={c.get('distinctPct',0):.0f}%)"
+                )
+
+            prompt = (
+                f"You are a data catalog expert writing a detailed description for business and technical users.\n"
+                f'Dataset: "{ds_name}"\n'
+                f"Rows: {total_rows:,} | Columns: {len(columns)}\n"
+                f"Completeness: {summary.get('avgCompleteness',0):.1f}% | Uniqueness: {summary.get('avgUniqueness',0):.1f}%\n"
+                f"Types: {summary.get('numericColumns',0)} numeric, {summary.get('categoricalColumns',0)} categorical, "
+                f"{summary.get('datetimeColumns',0)} datetime, {summary.get('stringColumns',0)} string\n"
+                f"Columns:\n{chr(10).join(col_lines)}\n\n"
+                f"Write a professional dataset description covering:\n"
+                f"- What this dataset represents and its business domain (2-3 sentences)\n"
+                f"- Key entities or concepts captured (1-2 sentences)\n"
+                f"- Data structure highlights — identifiers, measures, time coverage (2 sentences)\n"
+                f"- Data quality characteristics — completeness, uniqueness (1-2 sentences)\n"
+                f"- Suggested use cases (2-3 specific bullet points starting with •)\n"
+                f"Be specific to this dataset. No markdown headers. Plain paragraphs and bullets only."
+            )
+
+            model_name = os.getenv("AZURE_OPENAI_DEPLOYMENT", os.getenv("AZURE_OPENAI_MODEL", "Llama-3.3-70B-Instruct"))
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=600,
+            )
+
+            raw = response.choices[0].message.content
+            if raw and len(raw.strip()) > 80:
+                print(f"[profiling] ✓ AI description generated via LLM client ({len(raw)} chars)")
+                return raw.strip()
+    except Exception as e:
+        print(f"[profiling] LLM client description failed (non-fatal): {e}")
+
+    # ── Priority 2: Fallback to raw HTTP with CORRECT auth (Bearer token) ────
+    if _KEY and _ENDPOINT:
+        try:
+            col_lines = []
+            for c in columns[:20]:
+                sem   = c.get("entity",{}).get("semanticType","")
+                ctype = c.get("columnType", c.get("typeClass",""))
+                col_lines.append(
+                    f"  {c['columnName']} ({ctype}, semantic={sem}, "
+                    f"nulls={c.get('nullPct',0):.1f}%, unique={c.get('distinctPct',0):.0f}%)"
+                )
+
+            prompt = (
+                f"You are a data catalog expert. Describe dataset '{ds_name}' "
+                f"({total_rows:,} rows, {len(columns)} columns). "
+                f"Cover: business domain, key entities, data structure, quality, use cases. "
+                f"Columns: {', '.join(c['columnName'] for c in columns[:10])}. "
+                f"Plain paragraphs only, no markdown."
+            )
+
+            model_name = os.getenv("AZURE_OPENAI_DEPLOYMENT", os.getenv("AZURE_OPENAI_MODEL", "Llama-3.3-70B-Instruct"))
+
+            # FIXED: Use /v1/chat/completions with Bearer auth (Azure AI Foundry format)
+            r = _http.post(
+                f"{_ENDPOINT}/v1/chat/completions",
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {_KEY}",
+                },
+                json={
+                    "model": model_name,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.3,
+                    "max_tokens": 600,
+                },
+                timeout=35,
+            )
+            r.raise_for_status()
+            raw = r.json()["choices"][0]["message"]["content"]
+            if raw and len(raw.strip()) > 80:
+                print(f"[profiling] ✓ AI description generated via HTTP ({len(raw)} chars)")
+                return raw.strip()
+        except Exception as e:
+            print(f"[profiling] HTTP AI description failed (non-fatal): {e}")
+
+    # ── Priority 3: Fallback to template ─────────────────────────────────────
     return _fallback_description(ds_name, total_rows, columns, summary)
 
 
@@ -493,6 +654,11 @@ def _profile_column(col: str, ctype: str, series: pd.Series, total_rows: int) ->
             "regexPatterns":_detect_patterns(non_null)})
     base["entity"]  = _entity_profile(col, ctype, series)
     base["pattern"] = _pattern_profile(non_null)
+
+    # ── NEW: Add sensitivity classification ────────────────────────────────────
+    sample_vals = non_null.head(20).tolist() if len(non_null) > 0 else []
+    base["sensitivity"] = _classify_sensitivity(col, ctype, sample_vals)
+
     return base
 
 
@@ -559,7 +725,43 @@ def run_detail_profiling(db: Session, dataset_id: int) -> dict:
     raw = (dataset.display_name or dataset.physical_name or "") if dataset else ""
     ds_name = raw.split("/")[-1].split("\\")[-1]
     total_runs = db.query(ProfilingRun).filter(ProfilingRun.dataset_id==dataset_id, ProfilingRun.status=="COMPLETED").count()
-    return _build_profile_payload(run, df, total_runs, ds_name)
+
+    payload = _build_profile_payload(run, df, total_runs, ds_name)
+
+    # ── Save AI summary to profiling_runs table ───────────────────────────────
+    description = payload.get("description", "")
+    if description and len(description) > 50:
+        _save_ai_summary_to_db(run.id, description)
+
+    # ── Save sensitivity labels + AI descriptions to column_profiles ──────────
+    for col_data in payload.get("columns", []):
+        col_name = col_data.get("columnName")
+        if not col_name:
+            continue
+
+        # Save sensitivity label
+        sensitivity = col_data.get("sensitivity", "Public")
+        _save_sensitivity_to_db(run.id, col_name, sensitivity)
+
+        # Generate and save per-column AI description
+        entity = col_data.get("entity", {})
+        sem_type = entity.get("semanticType", col_data.get("columnType", "Unknown"))
+        type_class = col_data.get("typeClass", "Unknown")
+        null_pct = col_data.get("nullPct", 0)
+        distinct_pct = col_data.get("distinctPct", 0)
+
+        col_desc = (
+            f"Column '{col_name}' is of type {type_class} (semantic: {sem_type}). "
+            f"Completeness: {100 - null_pct:.1f}%, Uniqueness: {distinct_pct:.0f}%. "
+        )
+        if null_pct > 0:
+            col_desc += f"Contains {col_data.get('nullCount', 0)} null values. "
+        if col_data.get("distinctCount", 0) > 0:
+            col_desc += f"Has {col_data.get('distinctCount', 0)} distinct values. "
+
+        _save_ai_description_to_db(run.id, col_name, col_desc)
+
+    return payload
 
 
 def get_detail_profile(db: Session, dataset_id: int) -> dict:
@@ -572,4 +774,40 @@ def get_detail_profile(db: Session, dataset_id: int) -> dict:
     raw = (dataset.display_name or dataset.physical_name or "") if dataset else ""
     ds_name = raw.split("/")[-1].split("\\")[-1]
     total_runs = db.query(ProfilingRun).filter(ProfilingRun.dataset_id==dataset_id, ProfilingRun.status=="COMPLETED").count()
-    return _build_profile_payload(run, df, total_runs, ds_name)
+
+    payload = _build_profile_payload(run, df, total_runs, ds_name)
+
+    # ── Save AI summary if not already saved ──────────────────────────────────
+    description = payload.get("description", "")
+    if description and len(description) > 50:
+        # Check if already saved
+        if not getattr(run, 'ai_summary', None):
+            _save_ai_summary_to_db(run.id, description)
+
+    # ── Save sensitivity labels + AI descriptions ─────────────────────────────
+    for col_data in payload.get("columns", []):
+        col_name = col_data.get("columnName")
+        if not col_name:
+            continue
+
+        sensitivity = col_data.get("sensitivity", "Public")
+        _save_sensitivity_to_db(run.id, col_name, sensitivity)
+
+        entity = col_data.get("entity", {})
+        sem_type = entity.get("semanticType", col_data.get("columnType", "Unknown"))
+        type_class = col_data.get("typeClass", "Unknown")
+        null_pct = col_data.get("nullPct", 0)
+        distinct_pct = col_data.get("distinctPct", 0)
+
+        col_desc = (
+            f"Column '{col_name}' is of type {type_class} (semantic: {sem_type}). "
+            f"Completeness: {100 - null_pct:.1f}%, Uniqueness: {distinct_pct:.0f}%. "
+        )
+        if null_pct > 0:
+            col_desc += f"Contains {col_data.get('nullCount', 0)} null values. "
+        if col_data.get("distinctCount", 0) > 0:
+            col_desc += f"Has {col_data.get('distinctCount', 0)} distinct values. "
+
+        _save_ai_description_to_db(run.id, col_name, col_desc)
+
+    return payload
