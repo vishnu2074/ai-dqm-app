@@ -9,7 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path as _Path
 
 # ── App — created FIRST before any imports that might fail ───────────────────
-app = FastAPI(title="AI DQM Backend", version="2.5.0")
+app = FastAPI(title="AI DQM Backend", version="2.6.0")
 
 # ── CORS ─────────────────────────────────────────────────────────────────────
 _HEALTH_DASHBOARD_URL = os.getenv("HEALTH_DASHBOARD_URL", "")
@@ -18,14 +18,10 @@ _extra = [_HEALTH_DASHBOARD_URL] if _HEALTH_DASHBOARD_URL else []
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:3000",
-        "http://127.0.0.1:5173",
-        "http://127.0.0.1:3000",
-        "http://localhost:5174",
-        "http://localhost:8001",
-        *_extra,
-        "*",
+        "http://localhost:5173", "http://localhost:3000",
+        "http://127.0.0.1:5173", "http://127.0.0.1:3000",
+        "http://localhost:5174", "http://localhost:8001",
+        *_extra, "*",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -41,7 +37,7 @@ _STARTUP_ERRORS: list[str] = []
 def api_health():
     return {
         "status": "ok",
-        "version": "2.5.0",
+        "version": "2.6.0",
         "startup_errors": _STARTUP_ERRORS,
         "python": sys.version,
     }
@@ -80,11 +76,7 @@ try:
                         if col not in existing:
                             conn.exec_driver_sql(f"ALTER TABLE dq_rules ADD COLUMN {col} {defn}")
 
-                # ── ADDED: profiling_runs timing columns ──────────────────────
-                # Required by health_metrics_router to compute:
-                #   avg_llm_latency_ms, avg_profiling_runtime_s,
-                #   avg_job_duration_ms, api_throughput
-                # Without these, all timing metrics remain 0.
+                # ── profiling_runs timing columns ──────────────────────────────
                 pr_exists = conn.execute(
                     text("SELECT name FROM sqlite_master WHERE type='table' AND name='profiling_runs'")
                 ).fetchone()
@@ -92,18 +84,15 @@ try:
                     pr_cols = conn.execute(text("PRAGMA table_info(profiling_runs)")).fetchall()
                     pr_existing = {row[1] for row in pr_cols}
                     for col, defn in [
-                        ("started_at",   "TEXT"),        # ISO-8601 UTC timestamp
-                        ("completed_at", "TEXT"),        # ISO-8601 UTC timestamp
-                        ("duration_ms",  "INTEGER"),     # explicit ms if tracked directly
+                        ("started_at",   "TEXT"),
+                        ("completed_at", "TEXT"),
+                        ("duration_ms",  "INTEGER"),
                     ]:
                         if col not in pr_existing:
                             try:
-                                conn.exec_driver_sql(
-                                    f"ALTER TABLE profiling_runs ADD COLUMN {col} {defn}"
-                                )
+                                conn.exec_driver_sql(f"ALTER TABLE profiling_runs ADD COLUMN {col} {defn}")
                                 print(f"[bootstrap] Added column profiling_runs.{col}")
                             except Exception as col_err:
-                                # Column may already exist in some environments
                                 _STARTUP_ERRORS.append(f"add_col_{col}: {col_err}")
 
                 conn.commit()
@@ -120,25 +109,19 @@ try:
     except Exception as e:
         _STARTUP_ERRORS.append(f"periodic_backup: {e}")
 
-    # ── ADDED: Extract real DB path from SQLAlchemy engine URL ───────────────
-    # health_metrics_router uses raw sqlite3 + DB_PATH env var.
-    # We extract the path here so both layers always point to the same file,
-    # regardless of what DATABASE_URL is set to in Render.
+    # ── Extract real DB path from SQLAlchemy engine URL ───────────────────────
     try:
         _db_url = str(engine.url)
         if _db_url.startswith("sqlite:////"):
-            # Four slashes = absolute path on Unix: sqlite:////tmp/...
             _db_path = "/" + _db_url[len("sqlite:////"):]
         elif _db_url.startswith("sqlite:///"):
-            # Three slashes = relative path
             _db_path = _db_url[len("sqlite:///"):]
         else:
-            _db_path = "/tmp/ai-dqm/ai_dqm.db"  # safe fallback
+            _db_path = "/tmp/ai-dqm/ai_dqm.db"
 
         os.environ["DB_PATH"] = _db_path
         print(f"[startup] DB_PATH set to: {_db_path}")
     except Exception as e:
-        # Fallback: use the default path the router already knows about
         os.environ.setdefault("DB_PATH", "/tmp/ai-dqm/ai_dqm.db")
         _STARTUP_ERRORS.append(f"db_path_extract: {e}")
 
@@ -148,37 +131,16 @@ except Exception as e:
     msg = f"DB bootstrap FAILED: {e}"
     _STARTUP_ERRORS.append(msg)
     print(f"[startup] WARNING: {msg}")
-    # Still set a default DB_PATH so the health-metrics router can attempt to connect
     os.environ.setdefault("DB_PATH", "/tmp/ai-dqm/ai_dqm.db")
 
 
-# ── ADDED: LLM client factory (Azure AI Foundry — Llama 3.3 70B) ─────────────
-# Replaces any AzureOpenAI client initialization scattered through profiling code.
-# Import this wherever you make LLM calls:
-#
-#   from app.main import get_llm_client
-#   client = get_llm_client()
-#   if client:
-#       response = client.chat.completions.create(
-#           model=os.getenv("AZURE_OPENAI_DEPLOYMENT", "Llama-3.3-70B-Instruct"),
-#           messages=[{"role": "user", "content": prompt}],
-#           max_tokens=500,
-#       )
-#
-# WHY THIS FIX:
-#   AzureOpenAI constructs URLs as:
-#     {endpoint}/openai/deployments/{model}/chat/completions?api-version=xxx
-#   This returns 404 for Llama models on Azure AI Foundry.
-#   Foundry uses the OpenAI-compatible path:
-#     {endpoint}/v1/chat/completions   (no api-version, Bearer auth)
-#
+# ── LLM client factory (Azure AI Foundry — Llama 3.3 70B) ─────────────────────
 _llm_client_instance = None
 
 def get_llm_client():
     """
     Returns an OpenAI-compatible client for Azure AI Foundry (Llama/non-GPT models).
     Returns None if env vars are not configured — callers must handle None gracefully.
-    Thread-safe: client is created once and reused.
     """
     global _llm_client_instance
     if _llm_client_instance is not None:
@@ -194,8 +156,8 @@ def get_llm_client():
     try:
         from openai import OpenAI
         _llm_client_instance = OpenAI(
-            base_url=f"{endpoint}/v1",  # ← Foundry path, NOT /openai/deployments/
-            api_key=api_key,            # ← sent as Bearer token automatically
+            base_url=f"{endpoint}/v1",  # Foundry path
+            api_key=api_key,
         )
         print(f"[llm] Client initialised → {endpoint}/v1")
         return _llm_client_instance
@@ -204,9 +166,6 @@ def get_llm_client():
         print(f"[llm] ERROR initialising client: {e}")
         return None
 
-
-# Eagerly attempt client creation at startup so any misconfiguration
-# is logged immediately rather than silently at first LLM call.
 get_llm_client()
 
 
@@ -344,10 +303,7 @@ def _start_scheduler():
 _load("profiling_scheduler", _start_scheduler)
 
 # ── Health Metrics Router ─────────────────────────────────────────────────────
-# Registers GET /api/health-metrics
-# No prefix — the router already defines the full /api/health-metrics path.
-# DB_PATH is set above from the SQLAlchemy engine URL so the router's
-# raw sqlite3 connection hits the same database file.
+# Registers GET /api/health-metrics and GET /debug/schema-inspection
 def _reg_health_metrics():
     from app.routers.health_metrics_router import router as hm_router
     app.include_router(hm_router)
@@ -382,11 +338,6 @@ if (_FRONTEND_DIST / "index.html").exists():
 
     @app.get("/{full_path:path}", include_in_schema=False)
     def _serve_spa(full_path: str):
-        # IMPORTANT: Never intercept /api/* — let FastAPI 404 naturally for unknown API paths.
-        # This guard is a safety net; all real /api/ routes are registered above
-        # and FastAPI matches them before this catch-all runs.
-        # The ONLY way this guard fires is if someone requests a genuinely
-        # non-existent /api/... path — return proper JSON 404 in that case.
         if full_path.startswith("api/") or full_path == "api":
             return JSONResponse({"detail": "Not Found"}, status_code=404)
         return _FileResponse(str(_FRONTEND_DIST / "index.html"))
