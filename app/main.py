@@ -9,7 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path as _Path
 
 # ── App — created FIRST before any imports that might fail ───────────────────
-app = FastAPI(title="AI DQM Backend", version="2.6.0")
+app = FastAPI(title="AI DQM Backend", version="2.7.0")
 
 # ── CORS ─────────────────────────────────────────────────────────────────────
 _HEALTH_DASHBOARD_URL = os.getenv("HEALTH_DASHBOARD_URL", "")
@@ -37,7 +37,7 @@ _STARTUP_ERRORS: list[str] = []
 def api_health():
     return {
         "status": "ok",
-        "version": "2.6.0",
+        "version": "2.7.0",
         "startup_errors": _STARTUP_ERRORS,
         "python": sys.version,
     }
@@ -94,6 +94,66 @@ try:
                                 print(f"[bootstrap] Added column profiling_runs.{col}")
                             except Exception as col_err:
                                 _STARTUP_ERRORS.append(f"add_col_{col}: {col_err}")
+                    
+                    # ── NEW: Backfill started_at and completed_at from timestamp ──
+                    # This fixes api_throughput = 0 issue
+                    try:
+                        # Check if we have NULL values that need backfilling
+                        null_check = conn.execute(
+                            text("SELECT COUNT(*) FROM profiling_runs WHERE started_at IS NULL AND timestamp IS NOT NULL")
+                        ).fetchone()
+                        
+                        if null_check and null_check[0] > 0:
+                            print(f"[bootstrap] Backfilling {null_check[0]} profiling_runs timestamps...")
+                            
+                            # Backfill started_at from timestamp
+                            conn.exec_driver_sql("""
+                                UPDATE profiling_runs 
+                                SET started_at = timestamp
+                                WHERE started_at IS NULL AND timestamp IS NOT NULL
+                            """)
+                            
+                            # Backfill completed_at from timestamp + duration_ms
+                            conn.exec_driver_sql("""
+                                UPDATE profiling_runs 
+                                SET completed_at = datetime(timestamp, '+' || COALESCE(duration_ms, 0) || ' milliseconds')
+                                WHERE completed_at IS NULL AND timestamp IS NOT NULL
+                            """)
+                            
+                            conn.commit()
+                            print("[bootstrap] ✓ Timestamp backfill complete")
+                    except Exception as backfill_err:
+                        _STARTUP_ERRORS.append(f"timestamp_backfill: {backfill_err}")
+                        print(f"[bootstrap] ✗ Timestamp backfill failed: {backfill_err}")
+
+                # ── NEW: drift_records created_at column ────────────────────────
+                dr_exists = conn.execute(
+                    text("SELECT name FROM sqlite_master WHERE type='table' AND name='drift_records'")
+                ).fetchone()
+                if dr_exists:
+                    dr_cols = conn.execute(text("PRAGMA table_info(drift_records)")).fetchall()
+                    dr_existing = {row[1] for row in dr_cols}
+                    
+                    if "created_at" not in dr_existing:
+                        try:
+                            conn.exec_driver_sql("ALTER TABLE drift_records ADD COLUMN created_at TEXT")
+                            print("[bootstrap] Added column drift_records.created_at")
+                            
+                            # Backfill from profiling_runs.timestamp
+                            conn.exec_driver_sql("""
+                                UPDATE drift_records 
+                                SET created_at = (
+                                    SELECT timestamp 
+                                    FROM profiling_runs 
+                                    WHERE id = drift_records.profiling_run_id
+                                )
+                                WHERE created_at IS NULL AND profiling_run_id IS NOT NULL
+                            """)
+                            conn.commit()
+                            print("[bootstrap] ✓ drift_records.created_at backfill complete")
+                        except Exception as dr_err:
+                            _STARTUP_ERRORS.append(f"drift_created_at: {dr_err}")
+                            print(f"[bootstrap] ✗ drift_records.created_at failed: {dr_err}")
 
                 conn.commit()
         except Exception as e:

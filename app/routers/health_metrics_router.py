@@ -610,7 +610,11 @@ def _tab_monitoring_trends(conn, schema, dataset_id) -> dict:
         avg_per_day = round(runs_last_7 / 7, 2) if runs_last_7 > 0 else None
     art_status = "healthy" if runs_last_7 > 0 else "critical"
 
+    # ── DRIFT DETECTION PRECISION — Updated to use drift_type column ──────────
+    dr_cols = _columns(conn, "drift_records")
+    
     if schema["drift_has_severity"]:
+        # Use severity column if it exists
         row_drift = _one(conn,
             f"SELECT COUNT(CASE WHEN LOWER(severity) IN ('medium','high','critical') THEN 1 END) as significant, "
             f"COUNT(*) as total FROM drift_records WHERE 1=1 {ds_dr}", dr_p)
@@ -620,7 +624,19 @@ def _tab_monitoring_trends(conn, schema, dataset_id) -> dict:
         ddp_unit = "%"
         ddp_formula = "LOWER(severity) IN ('medium','high','critical') drift_records / total × 100"
         ddp_status = _status(ddp_val, healthy_ge=1, critical_lt=1) if drift_total > 0 else "neutral"
+    elif "drift_type" in dr_cols:
+        # NEW: Use drift_type column (MAJOR, CRITICAL, MINOR)
+        row_drift = _one(conn,
+            f"SELECT COUNT(CASE WHEN UPPER(drift_type) IN ('MAJOR','CRITICAL','HIGH') THEN 1 END) as significant, "
+            f"COUNT(*) as total FROM drift_records WHERE 1=1 {ds_dr}", dr_p)
+        significant = row_drift["significant"] if row_drift else 0
+        drift_total = row_drift["total"] if row_drift else 0
+        ddp_val = safe_pct(significant, drift_total)
+        ddp_unit = "%"
+        ddp_formula = "UPPER(drift_type) IN ('MAJOR','CRITICAL','HIGH') drift_records / total × 100"
+        ddp_status = _status(ddp_val, healthy_ge=1, critical_lt=1) if drift_total > 0 else "neutral"
     elif schema["drift_magnitude_col"]:
+        # Fallback to magnitude column
         mag_col = schema["drift_magnitude_col"]
         row_drift = _one(conn,
             f"SELECT COUNT(CASE WHEN ABS({mag_col}) > 0.1 THEN 1 END) as significant, "
@@ -632,30 +648,29 @@ def _tab_monitoring_trends(conn, schema, dataset_id) -> dict:
         ddp_formula = f"ABS({mag_col}) > 0.1 drift_records / total × 100"
         ddp_status = _status(ddp_val, healthy_ge=1, critical_lt=1) if drift_total > 0 else "neutral"
     else:
+        # Last resort: show total count
         row_drift = _one(conn, f"SELECT COUNT(*) as total FROM drift_records WHERE 1=1 {ds_dr}", dr_p)
         drift_total = row_drift["total"] if row_drift else 0
         ddp_val = float(drift_total)
         ddp_unit = "events"
-        ddp_formula = "Total drift records (severity/magnitude not tracked)"
+        ddp_formula = "Total drift records (no severity/type data available)"
         ddp_status = "warning" if drift_total > 100 else "healthy" if drift_total > 0 else "neutral"
         significant = drift_total
 
-    if ts_col and _table_exists(conn, "drift_records"):
-        dr_has_created = "created_at" in _columns(conn, "drift_records")
-        if dr_has_created:
-            row_last7 = _one(conn, f"SELECT COUNT(*) as cnt FROM drift_records WHERE created_at >= ? {ds_dr}", [cutoff_7d] + dr_p)
-            row_prev7 = _one(conn, f"SELECT COUNT(*) as cnt FROM drift_records WHERE created_at >= ? AND created_at < ? {ds_dr}", [cutoff_14d, cutoff_7d] + dr_p)
-            last7 = row_last7["cnt"] if row_last7 else 0
-            prev7 = row_prev7["cnt"] if row_prev7 else 0
-            trend = round(((last7 - prev7) / max(prev7, 1)) * 100, 1) if prev7 > 0 else None
-            dvt_status = ("healthy" if trend is not None and trend < 0 else "warning" if trend is not None and trend > 50 else "neutral")
-        else:
-            last7, prev7, trend = 0, 0, None
-            dvt_status = "neutral"
+    # ── DRIFT VOLUME TREND — Now works with backfilled created_at ─────────────
+    dr_has_created = "created_at" in dr_cols
+    if ts_col and _table_exists(conn, "drift_records") and dr_has_created:
+        row_last7 = _one(conn, f"SELECT COUNT(*) as cnt FROM drift_records WHERE created_at >= ? {ds_dr}", [cutoff_7d] + dr_p)
+        row_prev7 = _one(conn, f"SELECT COUNT(*) as cnt FROM drift_records WHERE created_at >= ? AND created_at < ? {ds_dr}", [cutoff_14d, cutoff_7d] + dr_p)
+        last7 = row_last7["cnt"] if row_last7 else 0
+        prev7 = row_prev7["cnt"] if row_prev7 else 0
+        trend = round(((last7 - prev7) / max(prev7, 1)) * 100, 1) if prev7 > 0 else None
+        dvt_status = ("healthy" if trend is not None and trend < 0 else "warning" if trend is not None and trend > 50 else "neutral")
     else:
         last7, prev7, trend = 0, 0, None
         dvt_status = "neutral"
 
+    # ── HEALTH SCORE VOLATILITY ───────────────────────────────────────────────
     qs_cols = _columns(conn, "quality_snapshots")
     score_col = next((c for c in ("score", "health_score", "quality_score") if c in qs_cols), None)
     ds_qs = "AND dataset_id = ?" if dataset_id else ""
@@ -686,6 +701,7 @@ def _tab_monitoring_trends(conn, schema, dataset_id) -> dict:
         "explainability": {"overview": "Monitoring tracks profiling activity, drift signal quality, and health score stability over time."},
     }
 
+# ... (keep all the rest of the file the same) ...
 
 # ═════════════════════════════════════════════════════════════════════════════
 # TAB 6 — ANOMALIES AI
