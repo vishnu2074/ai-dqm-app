@@ -138,10 +138,6 @@ except Exception as e:
 _llm_client_instance = None
 
 def get_llm_client():
-    """
-    Returns an OpenAI-compatible client for Azure AI Foundry (Llama/non-GPT models).
-    Returns None if env vars are not configured — callers must handle None gracefully.
-    """
     global _llm_client_instance
     if _llm_client_instance is not None:
         return _llm_client_instance
@@ -156,7 +152,7 @@ def get_llm_client():
     try:
         from openai import OpenAI
         _llm_client_instance = OpenAI(
-            base_url=f"{endpoint}/v1",  # Foundry path
+            base_url=f"{endpoint}/v1",
             api_key=api_key,
         )
         print(f"[llm] Client initialised → {endpoint}/v1")
@@ -303,7 +299,6 @@ def _start_scheduler():
 _load("profiling_scheduler", _start_scheduler)
 
 # ── Health Metrics Router ─────────────────────────────────────────────────────
-# Registers GET /api/health-metrics and GET /debug/schema-inspection
 def _reg_health_metrics():
     from app.routers.health_metrics_router import router as hm_router
     app.include_router(hm_router)

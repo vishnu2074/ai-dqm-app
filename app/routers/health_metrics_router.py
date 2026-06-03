@@ -1,15 +1,12 @@
 """
-health_metrics_router.py  —  AI DQM Health Observatory  v4.0
+health_metrics_router.py  —  AI DQM Health Observatory  v4.1
 ─────────────────────────────────────────────────────────────
 Complete rewrite with dynamic schema introspection.
 
-Key fixes vs v3:
-  • Dynamic status mapping for profiling_runs and dq_rules (no more hardcoded 'completed')
-  • Fallback logic for missing timestamps (created_at/started_at)
-  • Fallback logic for missing drift severity (checks magnitude or shows total count)
-  • Alternative column detection for temporal_checks context (explanation/root_cause/notes)
-  • Safe SQL escaping for all dynamic filters
-  • Debug endpoint for schema inspection
+Key fixes vs v4.0:
+  • FIXED: Removed backslashes from inside f-string expressions (SyntaxError in Python 3.11)
+  • Added _in_clause() helper to safely build SQL IN clauses
+  • Fixed dict() conversion for sqlite3.Row in debug endpoint
 """
 
 import os
@@ -80,6 +77,14 @@ def _esc(s: str) -> str:
     """Escape single quotes for SQL strings."""
     return str(s).replace("'", "''")
 
+def _in_clause(col: str, values: set | list) -> str:
+    """Build a safe SQL IN clause for a list of string values without using backslashes in f-strings."""
+    if not values:
+        return "1=0"
+    escaped = [_esc(v) for v in values]
+    parts = ["'" + v + "'" for v in escaped]
+    return f"{col} IN ({','.join(parts)})"
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # METRIC BUILDING HELPERS
@@ -141,12 +146,11 @@ def _introspect(conn) -> dict:
     pr_completed = [s for s in pr_statuses if s.lower() in completed_keywords]
     pr_failed = [s for s in pr_statuses if s.lower() in failed_keywords]
     
-    # Fallback: if no explicit completed statuses, assume all non-failed are completed
     if not pr_completed and pr_statuses:
         pr_completed = [s for s in pr_statuses if s not in pr_failed]
         
-    pr_completed_filter = f"status IN ({','.join(f\"'{_esc(s)}'\" for s in pr_completed)})" if pr_completed else "1=0"
-    pr_failed_filter = f"status IN ({','.join(f\"'{_esc(s)}'\" for s in pr_failed)})" if pr_failed else "1=0"
+    pr_completed_filter = _in_clause("status", pr_completed)
+    pr_failed_filter = _in_clause("status", pr_failed)
 
     # ── 2. dq_rules status mapping ────────────────────────────────────────────
     dq_statuses = set()
@@ -158,7 +162,7 @@ def _introspect(conn) -> dict:
     if not dq_active and dq_statuses:
         dq_active = [s for s in dq_statuses if s.lower() not in {'inactive', 'disabled', 'off', 'false', '0', 'deleted', 'archived'}]
         
-    dq_active_filter = f"status IN ({','.join(f\"'{_esc(s)}'\" for s in dq_active)})" if dq_active else "1=0"
+    dq_active_filter = _in_clause("status", dq_active)
 
     # ── 3. drift_records severity / magnitude ─────────────────────────────────
     severity_dist = {}
@@ -533,11 +537,11 @@ def _tab_dq_rules(conn, schema, dataset_id) -> dict:
 
     ai_sources = schema["policy_sources"]
     ai_source_vals = ai_sources or {"llm", "ai", "gpt", "openai"}
-    in_clause = ",".join(f"'{_esc(v)}'" for v in ai_source_vals)
+    in_clause = _in_clause("source", ai_source_vals)
 
     row_ai = _one(conn,
         f"SELECT COUNT(CASE WHEN {active_filter} THEN 1 END) as accepted, "
-        f"COUNT(*) as suggested FROM dq_rules WHERE source IN ({in_clause}) {ds_r}", r_p)
+        f"COUNT(*) as suggested FROM dq_rules WHERE {in_clause} {ds_r}", r_p)
     ai_accepted  = row_ai["accepted"]  if row_ai else 0
     ai_suggested = row_ai["suggested"] if row_ai else 0
     rrar_val = safe_pct(ai_accepted, ai_suggested)
@@ -546,7 +550,7 @@ def _tab_dq_rules(conn, schema, dataset_id) -> dict:
     if ai_suggested > 0 and rr_rule_col:
         row_never = _one(conn,
             f"SELECT COUNT(*) as never_run FROM dq_rules r "
-            f"WHERE r.source IN ({in_clause}) "
+            f"WHERE {in_clause} "
             f"AND NOT EXISTS (SELECT 1 FROM dq_rule_runs rr WHERE rr.rule_id = r.id) {ds_r}", r_p)
         never_run = row_never["never_run"] if row_never else 0
     else:
@@ -961,12 +965,12 @@ def _tab_governance(conn, schema, dataset_id) -> dict:
     policy_sources = schema["policy_sources"]
 
     ai_candidates = policy_sources or {"llm", "ai", "gpt", "openai", "generated"}
-    in_cl = ",".join(f"'{_esc(v)}'" for v in ai_candidates)
+    in_cl = _in_clause("source", ai_candidates)
 
     if _table_exists(conn, policy_table):
         row_pol = _one(conn,
             f"SELECT COUNT(CASE WHEN LOWER(status) IN ('active','accepted','enabled') THEN 1 END) as accepted, "
-            f"COUNT(*) as suggested FROM {policy_table} WHERE source IN ({in_cl})")
+            f"COUNT(*) as suggested FROM {policy_table} WHERE {in_cl}")
         accepted = row_pol["accepted"] if row_pol else 0
         suggested = row_pol["suggested"] if row_pol else 0
         row_all = _one(conn, f"SELECT COUNT(*) FROM {policy_table}")
@@ -1204,7 +1208,8 @@ async def debug_schema_inspection():
         for tbl in ["profiling_runs", "dq_rules", "drift_records", "temporal_checks"]:
             if _table_exists(conn, tbl):
                 rows = _all(conn, f"SELECT * FROM {tbl} LIMIT 3")
-                samples[tbl] = [dict(r) for r in rows]
+                # Safely convert sqlite3.Row to dict
+                samples[tbl] = [{k: r[k] for k in r.keys()} for r in rows]
                 
         conn.close()
         return {"schema": schema, "samples": samples}
