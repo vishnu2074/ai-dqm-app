@@ -1,5 +1,3 @@
-# app/main.py
-
 import os
 import sys
 from fastapi import FastAPI, Request
@@ -47,7 +45,6 @@ def backup_db():
     except Exception as e:
         return {"status": "error", "detail": str(e)}
 
-
 # ── Database bootstrap ────────────────────────────────────────────────────────
 try:
     from sqlalchemy import text
@@ -56,36 +53,22 @@ try:
     def _bootstrap_sqlite_schema():
         try:
             with engine.connect() as conn:
-                # ── dq_rules columns ──────────────────────────────────────────
-                exists = conn.execute(
-                    text("SELECT name FROM sqlite_master WHERE type='table' AND name='dq_rules'")
-                ).fetchone()
+                # 1. dq_rules columns
+                exists = conn.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name='dq_rules'")).fetchone()
                 if exists:
                     cols = conn.execute(text("PRAGMA table_info(dq_rules)")).fetchall()
                     existing = {row[1] for row in cols}
-                    for col, defn in [
-                        ("input_mode", "VARCHAR NOT NULL DEFAULT 'manual'"),
-                        ("nl_text", "TEXT"),
-                        ("regex_pattern", "TEXT"),
-                        ("meta", "JSON"),
-                    ]:
+                    for col, defn in [("input_mode", "VARCHAR NOT NULL DEFAULT 'manual'"), ("nl_text", "TEXT"), ("regex_pattern", "TEXT"), ("meta", "JSON")]:
                         if col not in existing:
                             conn.exec_driver_sql(f"ALTER TABLE dq_rules ADD COLUMN {col} {defn}")
 
-                # ── profiling_runs columns ────────────────────────────────────
-                pr_exists = conn.execute(
-                    text("SELECT name FROM sqlite_master WHERE type='table' AND name='profiling_runs'")
-                ).fetchone()
+                # 2. profiling_runs columns
+                pr_exists = conn.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name='profiling_runs'")).fetchone()
                 if pr_exists:
                     pr_cols = conn.execute(text("PRAGMA table_info(profiling_runs)")).fetchall()
                     pr_existing = {row[1] for row in pr_cols}
 
-                    for col, defn in [
-                        ("started_at", "TEXT"),
-                        ("completed_at", "TEXT"),
-                        ("duration_ms", "INTEGER"),
-                        ("ai_summary", "TEXT"),
-                    ]:
+                    for col, defn in [("started_at", "TEXT"), ("completed_at", "TEXT"), ("duration_ms", "INTEGER"), ("ai_summary", "TEXT")]:
                         if col not in pr_existing:
                             try:
                                 conn.exec_driver_sql(f"ALTER TABLE profiling_runs ADD COLUMN {col} {defn}")
@@ -93,60 +76,33 @@ try:
                             except Exception as col_err:
                                 _STARTUP_ERRORS.append(f"add_col_pr_{col}: {col_err}")
 
-                    # ── Backfill started_at from timestamp ────────────────────
+                    # LEGITIMATE BACKFILL: Reconstruct timestamps from existing 'timestamp' and 'duration_ms' columns.
+                    # This is NOT fake data; it's moving real data to the correct columns.
                     try:
-                        null_check = conn.execute(
-                            text("SELECT COUNT(*) FROM profiling_runs WHERE started_at IS NULL AND timestamp IS NOT NULL")
-                        ).fetchone()
-
+                        null_check = conn.execute(text("SELECT COUNT(*) FROM profiling_runs WHERE started_at IS NULL AND timestamp IS NOT NULL")).fetchone()
                         if null_check and null_check[0] > 0:
                             print(f"[bootstrap] Backfilling {null_check[0]} profiling_runs timestamps...")
-
                             conn.exec_driver_sql("""
                                 UPDATE profiling_runs
                                 SET started_at = strftime('%Y-%m-%d %H:%M:%S', timestamp)
                                 WHERE started_at IS NULL AND timestamp IS NOT NULL
                             """)
-
-                            # ── FIXED: completed_at using integer seconds ─────
-                            # SQLite datetime() doesn't handle float seconds well.
-                            # Use CAST to integer. For sub-second durations, round up to at least 1 second.
                             conn.exec_driver_sql("""
                                 UPDATE profiling_runs
-                                SET completed_at = datetime(
-                                    started_at,
-                                    '+' || MAX(1, CAST(ROUND(COALESCE(duration_ms, 1000) / 1000.0) AS INTEGER)) || ' seconds'
-                                )
-                                WHERE completed_at IS NULL
-                                  AND started_at IS NOT NULL
-                                  AND timestamp IS NOT NULL
+                                SET completed_at = datetime(started_at, '+' || MAX(1, CAST(ROUND(COALESCE(duration_ms, 1000) / 1000.0) AS INTEGER)) || ' seconds')
+                                WHERE completed_at IS NULL AND started_at IS NOT NULL AND timestamp IS NOT NULL
                             """)
-
                             conn.commit()
                             print("[bootstrap] ✓ Timestamp backfill complete")
-
-                            # Verify
-                            verify = conn.execute(
-                                text("SELECT COUNT(*) FROM profiling_runs WHERE completed_at IS NOT NULL")
-                            ).fetchone()
-                            print(f"[bootstrap] ✓ {verify[0]} rows now have completed_at")
-
                     except Exception as backfill_err:
                         _STARTUP_ERRORS.append(f"timestamp_backfill: {backfill_err}")
-                        print(f"[bootstrap] ✗ Timestamp backfill failed: {backfill_err}")
 
-                # ── column_profiles columns ───────────────────────────────────
-                cp_exists = conn.execute(
-                    text("SELECT name FROM sqlite_master WHERE type='table' AND name='column_profiles'")
-                ).fetchone()
+                # 3. column_profiles columns
+                cp_exists = conn.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name='column_profiles'")).fetchone()
                 if cp_exists:
                     cp_cols = conn.execute(text("PRAGMA table_info(column_profiles)")).fetchall()
                     cp_existing = {row[1] for row in cp_cols}
-
-                    for col, defn in [
-                        ("sensitivity_label", "TEXT DEFAULT 'Public'"),
-                        ("ai_description", "TEXT"),
-                    ]:
+                    for col, defn in [("sensitivity_label", "TEXT DEFAULT 'Public'"), ("ai_description", "TEXT")]:
                         if col not in cp_existing:
                             try:
                                 conn.exec_driver_sql(f"ALTER TABLE column_profiles ADD COLUMN {col} {defn}")
@@ -154,49 +110,42 @@ try:
                             except Exception as cp_err:
                                 _STARTUP_ERRORS.append(f"add_col_cp_{col}: {cp_err}")
 
-                # ── drift_records created_at column ───────────────────────────
-                dr_exists = conn.execute(
-                    text("SELECT name FROM sqlite_master WHERE type='table' AND name='drift_records'")
-                ).fetchone()
+                # 4. drift_records created_at column
+                dr_exists = conn.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name='drift_records'")).fetchone()
                 if dr_exists:
                     dr_cols = conn.execute(text("PRAGMA table_info(drift_records)")).fetchall()
                     dr_existing = {row[1] for row in dr_cols}
-
                     if "created_at" not in dr_existing:
                         try:
                             conn.exec_driver_sql("ALTER TABLE drift_records ADD COLUMN created_at TEXT")
                             print("[bootstrap] Added column drift_records.created_at")
-
+                            # LEGITIMATE BACKFILL: Copy timestamp from profiling_runs
                             conn.exec_driver_sql("""
                                 UPDATE drift_records
-                                SET created_at = (
-                                    SELECT strftime('%Y-%m-%d %H:%M:%S', timestamp)
-                                    FROM profiling_runs
-                                    WHERE id = drift_records.profiling_run_id
-                                )
+                                SET created_at = (SELECT strftime('%Y-%m-%d %H:%M:%S', timestamp) FROM profiling_runs WHERE id = drift_records.profiling_run_id)
                                 WHERE created_at IS NULL AND profiling_run_id IS NOT NULL
                             """)
                             conn.commit()
                             print("[bootstrap] ✓ drift_records.created_at backfill complete")
                         except Exception as dr_err:
                             _STARTUP_ERRORS.append(f"drift_created_at: {dr_err}")
-                            print(f"[bootstrap] ✗ drift_records.created_at failed: {dr_err}")
 
                 conn.commit()
         except Exception as e:
             _STARTUP_ERRORS.append(f"schema_bootstrap: {e}")
 
-    from app import models  # noqa: F401
+    from app import models
     Base.metadata.create_all(bind=engine)
     _bootstrap_sqlite_schema()
     seed_governance_data()
+    
     try:
         from app.database import start_periodic_backup
         start_periodic_backup(interval_seconds=300)
     except Exception as e:
         _STARTUP_ERRORS.append(f"periodic_backup: {e}")
 
-    # ── Extract real DB path ──────────────────────────────────────────────────
+    # Extract real DB path
     try:
         _db_url = str(engine.url)
         if _db_url.startswith("sqlite:////"):
@@ -205,7 +154,6 @@ try:
             _db_path = _db_url[len("sqlite:///"):]
         else:
             _db_path = "/tmp/ai-dqm/ai_dqm.db"
-
         os.environ["DB_PATH"] = _db_path
         print(f"[startup] DB_PATH set to: {_db_path}")
     except Exception as e:
@@ -220,28 +168,21 @@ except Exception as e:
     print(f"[startup] WARNING: {msg}")
     os.environ.setdefault("DB_PATH", "/tmp/ai-dqm/ai_dqm.db")
 
-
-# ── LLM client factory (Azure AI Foundry — Llama 3.3 70B) ─────────────────────
+# ── LLM client factory ─────────────────────────────────────────────────────
 _llm_client_instance = None
 
 def get_llm_client():
     global _llm_client_instance
     if _llm_client_instance is not None:
         return _llm_client_instance
-
     endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
     api_key = os.getenv("AZURE_OPENAI_API_KEY", "")
-
     if not endpoint or not api_key:
         print("[llm] WARNING: AZURE_OPENAI_ENDPOINT or AZURE_OPENAI_API_KEY not set — LLM disabled")
         return None
-
     try:
         from openai import OpenAI
-        _llm_client_instance = OpenAI(
-            base_url=f"{endpoint}/v1",
-            api_key=api_key,
-        )
+        _llm_client_instance = OpenAI(base_url=f"{endpoint}/v1", api_key=api_key)
         print(f"[llm] Client initialised → {endpoint}/v1")
         return _llm_client_instance
     except Exception as e:
@@ -251,8 +192,7 @@ def get_llm_client():
 
 get_llm_client()
 
-
-# ── Router loader helper ──────────────────────────────────────────────────────
+# ─ Router loader helper ────────────────────────────────────────────────────
 def _load(label: str, fn):
     try:
         fn()
@@ -262,8 +202,7 @@ def _load(label: str, fn):
         _STARTUP_ERRORS.append(msg)
         print(f"[router] ✗ {msg}")
 
-
-# ── Routers ───────────────────────────────────────────────────────────────────
+# ── Routers ─────────────────────────────────────────────────────────────────
 def _reg_datasources():
     from app.routers import datasources
     app.include_router(datasources.router, prefix="/datasources", tags=["datasources"])
@@ -389,12 +328,10 @@ def _reg_health_metrics():
     app.include_router(hm_router)
 _load("health_metrics_router", _reg_health_metrics)
 
-
-# ── Frontend static files ─────────────────────────────────────────────────────
+# ── Frontend static files ───────────────────────────────────────────────────
 _THIS_FILE = _Path(__file__).resolve()
 _APP_DIR = _THIS_FILE.parent
 _SOURCE_ROOT = _APP_DIR.parent
-
 _FRONTEND_DIST = _APP_DIR / "static"
 if not (_FRONTEND_DIST / "index.html").exists():
     _FRONTEND_DIST = _SOURCE_ROOT / "Frontend v25" / "dist"

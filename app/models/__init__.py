@@ -58,12 +58,12 @@ class ProfilingRun(Base):
     status = Column(String, default="COMPLETED")
     error_message = Column(Text, nullable=True)
     is_full_scan = Column(Boolean, default=False)
-
-    # ── ADDED: Timing columns (populated by main.py migration) ──
+    
+    # ADDED: Timing columns (populated by main.py migration from real timestamp data)
     started_at = Column(String, nullable=True)
     completed_at = Column(String, nullable=True)
-
-    # ── ADDED: AI-generated dataset description ──
+    
+    # ADDED: AI-generated dataset description (populated by profiling_detail.py for NEW runs only)
     ai_summary = Column(Text, nullable=True)
 
     dataset = relationship("Dataset", back_populates="profiling_runs")
@@ -80,7 +80,6 @@ class ColumnProfile(Base):
     profiling_run_id = Column(Integer, ForeignKey("profiling_runs.id", ondelete="CASCADE"))
     column_name = Column(String)
     data_type = Column(String)
-
     completeness = Column(Float)
     uniqueness = Column(Float)
     validity = Column(Float)
@@ -88,17 +87,15 @@ class ColumnProfile(Base):
     accuracy = Column(Float)
     timeliness = Column(Float, nullable=True)
     integrity = Column(Float)
-
     null_count = Column(Integer)
     distinct_count = Column(Integer)
     min_length = Column(Integer, nullable=True)
     max_length = Column(Integer, nullable=True)
-
     patterns = Column(JSON, nullable=True)
     status = Column(String)
     health_score = Column(Float)
-
-    # ── ADDED: AI description and sensitivity classification ──
+    
+    # ADDED: AI description and sensitivity classification (populated by profiling_detail.py for NEW runs)
     ai_description = Column(Text, nullable=True)
     sensitivity_label = Column(String, nullable=True, default="Public")
 
@@ -114,7 +111,6 @@ class ProfilingBaseline(Base):
     metric_value = Column(Float)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     is_active = Column(Boolean, default=True)
-
     dataset = relationship("Dataset", back_populates="profiling_baselines")
     profiling_run = relationship("ProfilingRun", back_populates="profiling_baselines")
 
@@ -131,7 +127,6 @@ class QualityCheck(Base):
     llm_root_cause = Column(Text, nullable=True)
     llm_remediation = Column(Text, nullable=True)
     resolved_by_rule_id = Column(Integer, ForeignKey("dq_rules.id", ondelete="SET NULL"), nullable=True)
-
     profiling_run = relationship("ProfilingRun", back_populates="quality_checks")
 
 TemporalCheck = QualityCheck
@@ -144,8 +139,8 @@ class DriftRecord(Base):
     drift_score = Column(Float)
     drift_type = Column(String)
     comparison_run_id = Column(Integer, ForeignKey("profiling_runs.id", ondelete="CASCADE"), nullable=True)
-
-    # ── ADDED: Timestamp for trend analysis ──
+    
+    # ADDED: Timestamp for trend analysis (backfilled from profiling_runs.timestamp)
     created_at = Column(String, nullable=True)
 
     profiling_run = relationship("ProfilingRun", foreign_keys=[profiling_run_id], back_populates="drift_records")
@@ -162,7 +157,6 @@ class SchemaHistory(Base):
     old_type = Column(String, nullable=True)
     new_type = Column(String, nullable=True)
     impact = Column(String)
-
     dataset = relationship("Dataset", back_populates="schema_history_entries")
     profiling_run = relationship("ProfilingRun", back_populates="schema_history_entries")
 
@@ -183,7 +177,6 @@ class DQRule(Base):
     meta = Column(JSON, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
-
     dataset = relationship("Dataset", back_populates="dq_rules")
 
 class DQRuleChangeLog(Base):
@@ -197,7 +190,6 @@ class DQRuleChangeLog(Base):
     change_date = Column(DateTime(timezone=True), server_default=func.now())
     change_type = Column(String, default="Created")
     performance_delta = Column(String, default="N/A")
-
     dataset = relationship("Dataset", back_populates="dq_rule_change_logs")
 
 class DatasetVersion(Base):
@@ -210,7 +202,6 @@ class DatasetVersion(Base):
     created_by = Column(String, default="System", nullable=False)
     description = Column(Text, nullable=True)
     parent_version_id = Column(Integer, ForeignKey("dataset_versions.id", ondelete="SET NULL"), nullable=True)
-
     dataset = relationship("Dataset", back_populates="versions")
     parent = relationship("DatasetVersion", remote_side=[id])
 
@@ -225,7 +216,6 @@ class DQRuleRun(Base):
     output_version_id = Column(Integer, ForeignKey("dataset_versions.id", ondelete="SET NULL"), nullable=True)
     started_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     finished_at = Column(DateTime(timezone=True), nullable=True)
-
     dataset = relationship("Dataset", back_populates="dq_rule_runs")
     input_version = relationship("DatasetVersion", foreign_keys=[input_version_id])
     output_version = relationship("DatasetVersion", foreign_keys=[output_version_id])
@@ -244,11 +234,9 @@ class DQRuleRunResult(Base):
     violation_count = Column(Integer, default=0)
     samples_json = Column(Text, nullable=True)
     error_message = Column(Text, nullable=True)
-
     run = relationship("DQRuleRun", back_populates="results")
 
 class LineageEdge(Base):
-    """User-defined dataset to dataset lineage connections."""
     __tablename__ = "lineage_edges"
     id = Column(Integer, primary_key=True, index=True)
     source = Column(String, nullable=False, index=True)
@@ -275,7 +263,6 @@ class KnowledgeGraphEdge(Base):
     invalidated = Column(Boolean, default=False)
 
 class NotificationInbox(Base):
-    """Unified notification inbox for all system events."""
     __tablename__ = "notification_inbox"
     id = Column(String, primary_key=True, index=True)
     user_email = Column(String, nullable=True, index=True)
@@ -284,18 +271,16 @@ class NotificationInbox(Base):
     type = Column(String, default="ALERT", nullable=False)
     category = Column(String, default="System")
     severity = Column(String, default="info")
-
-    # ── NOTE: The actual DB table has 'dataset' TEXT column (see notification_inbox_routes.py)
-    #    but the model defines 'dataset_id' as Integer FK. We keep both for compatibility.
+    
+    # NOTE: 'dataset_id' is the Integer FK (often NULL). 'dataset' is the TEXT column (has values like 'test2.csv').
     dataset_id = Column(Integer, ForeignKey("datasets.id", ondelete="SET NULL"), nullable=True)
-    dataset = Column(String, nullable=True)  # Actual column in DB
-
+    dataset = Column(String, nullable=True) 
+    
     link = Column(String, nullable=True)
     source = Column(String, nullable=True)
     view_route = Column(String, nullable=True)
     read = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-
     ds = relationship("Dataset")
 
 class NotificationPreference(Base):
