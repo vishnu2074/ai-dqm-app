@@ -36,6 +36,33 @@ def api_health():
         "python": sys.version,
     }
 
+@app.post("/admin/reset-database")
+async def reset_database():
+    """Reset database - deletes all data and recreates tables"""
+    import os
+    from pathlib import Path
+    
+    db_path = os.getenv("DB_PATH", "/tmp/ai-dqm/ai_dqm.db")
+    
+    # Close all connections first
+    from app.database import engine
+    engine.dispose()
+    
+    # Delete the file
+    if os.path.exists(db_path):
+        os.remove(db_path)
+        print(f"✓ Deleted database at {db_path}")
+    
+    # Recreate tables
+    from app.database import Base
+    Base.metadata.create_all(bind=engine)
+    
+    return {
+        "status": "ok",
+        "message": "Database reset successfully",
+        "db_path": db_path
+    }
+
 @app.post("/api/backup-db", include_in_schema=False)
 def backup_db():
     try:
@@ -167,6 +194,18 @@ except Exception as e:
     _STARTUP_ERRORS.append(msg)
     print(f"[startup] WARNING: {msg}")
     os.environ.setdefault("DB_PATH", "/tmp/ai-dqm/ai_dqm.db")
+
+
+# In main.py, after DB bootstrap
+if os.getenv("RESET_DB_ON_START", "").lower() == "true":
+    import os
+    from pathlib import Path
+    
+    db_path = os.getenv("DB_PATH", "/tmp/ai-dqm/ai_dqm.db")
+    if os.path.exists(db_path):
+        os.remove(db_path)
+        print(f"[startup] ✓ Reset database at {db_path}")
+
 
 # ── LLM client factory ─────────────────────────────────────────────────────
 _llm_client_instance = None
@@ -362,5 +401,17 @@ if (_FRONTEND_DIST / "index.html").exists():
     print("[startup] SPA catch-all registered — frontend active")
 else:
     print("[startup] WARNING: index.html not found — API-only mode")
+
+    # Add this debug endpoint temporarily
+@app.get("/debug/db-info")
+def get_db_info():
+    import os
+    db_path = os.getenv("DB_PATH", "/tmp/ai-dqm/ai_dqm.db")
+    return {
+        "db_path": db_path,
+        "exists": os.path.exists(db_path),
+        "size_bytes": os.path.getsize(db_path) if os.path.exists(db_path) else 0,
+        "writable": os.access(os.path.dirname(db_path), os.W_OK)
+    }
 
 print("[startup] AI DQM Backend ready ✓")

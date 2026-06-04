@@ -2,29 +2,28 @@
 app/routers/lineage_edges.py
 ────────────────────────────
 CRUD endpoints for user-defined dataset → dataset lineage connections.
-
 Edges are stored in the `lineage_edges` DB table (not JSON).
 Every add/delete busts the lineage graph cache so the next
 GET /lineage/graph immediately reflects the change.
 
 Endpoints:
-  GET    /lineage/edges          → list all edges + all nodes (for UI dropdowns)
-  POST   /lineage/edges          → add a new edge
-  DELETE /lineage/edges          → remove an edge
+GET    /lineage/edges          → list all edges + all nodes (for UI dropdowns)
+POST   /lineage/edges          → add a new edge
+DELETE /lineage/edges          → remove an edge
 """
-
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-
 from app.database import SessionLocal
 
 def get_db():
+    """Database session dependency"""
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
+
 from app.graph.lineage_engine import LineageEngine, invalidate_cache
 
 # Import model — adjust path if LineageEdge lives inside models.py directly
@@ -33,17 +32,13 @@ try:
 except ImportError:
     from app.models.lineage_edge import LineageEdge
 
-
 router = APIRouter(prefix="/lineage/edges", tags=["Lineage Edges"])
-
 
 class EdgePayload(BaseModel):
     source: str   # node id  (e.g. "customers_csv")
     target: str   # node id  (e.g. "customer_360_view")
 
-
 # ── GET ────────────────────────────────────────────────────────────────────────
-
 @router.get("")
 def get_edges(db: Session = Depends(get_db)):
     """
@@ -52,7 +47,7 @@ def get_edges(db: Session = Depends(get_db)):
     """
     full_graph = LineageEngine.get_full_graph()
     db_edges   = db.query(LineageEdge).all()
-
+    
     return {
         "nodes": full_graph["nodes"],
         "edges": [
@@ -61,9 +56,7 @@ def get_edges(db: Session = Depends(get_db)):
         ],
     }
 
-
-# ── POST ───────────────────────────────────────────────────────────────────────
-
+# ── POST ──────────────────────────────────────────────────────────────────────
 @router.post("")
 def add_edge(payload: EdgePayload, db: Session = Depends(get_db)):
     """Add a directed edge source → target. Idempotent — rejects duplicates."""
@@ -80,12 +73,12 @@ def add_edge(payload: EdgePayload, db: Session = Depends(get_db)):
     if payload.source not in node_ids:
         raise HTTPException(
             status_code=404,
-            detail=f"Source node '{payload.source}' not found in lineage graph."
+            detail=f"Source node '{payload.source}' not found in lineage graph. "
         )
     if payload.target not in node_ids:
         raise HTTPException(
             status_code=404,
-            detail=f"Target node '{payload.target}' not found in lineage graph."
+            detail=f"Target node '{payload.target}' not found in lineage graph. "
         )
 
     # Reject duplicate
@@ -112,16 +105,13 @@ def add_edge(payload: EdgePayload, db: Session = Depends(get_db)):
 
     return {"status": "created", "source": payload.source, "target": payload.target}
 
-
 # ── DELETE ─────────────────────────────────────────────────────────────────────
-
 @router.delete("")
 def delete_edge(payload: EdgePayload, db: Session = Depends(get_db)):
     """Remove a directed edge source → target."""
     edge = db.query(LineageEdge).filter_by(
         source=payload.source, target=payload.target
     ).first()
-
     if not edge:
         raise HTTPException(status_code=404, detail="Edge not found.")
 

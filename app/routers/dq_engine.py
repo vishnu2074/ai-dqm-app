@@ -1,26 +1,25 @@
-# python-backend/app/routers/dq_engine.py
+"""
+python-backend/app/routers/dq_engine.py
+DQ Engine endpoints for preview and save operations
+"""
 from __future__ import annotations
-
 from typing import List, Optional
-
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-
 from app.database import SessionLocal
 from app.services import dq_engine as dq_engine_service
 
 router = APIRouter(prefix="/dq-engine", tags=["dq-engine"])
 
-
 def get_db():
+    """Database session dependency"""
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
-
 
 class PreviewPayload(BaseModel):
     version_id: Optional[int] = None
@@ -29,9 +28,9 @@ class PreviewPayload(BaseModel):
     preview_rows: int = 25
     samples_per_rule: int = 10
 
-
 @router.post("/{dataset_id}/preview")
 def preview_apply(dataset_id: int, payload: PreviewPayload, db: Session = Depends(get_db)):
+    """Preview DQ rule application on dataset"""
     try:
         return dq_engine_service.preview_apply_rules(
             db=db,
@@ -47,15 +46,14 @@ def preview_apply(dataset_id: int, payload: PreviewPayload, db: Session = Depend
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Preview apply failed: {str(e)}")
 
-
 class SavePayload(BaseModel):
     run_id: int
     description: Optional[str] = None
     created_by: str = "Admin"
 
-
 @router.post("/{dataset_id}/save")
 def save_run(dataset_id: int, payload: SavePayload, db: Session = Depends(get_db)):
+    """Save preview results as new dataset version"""
     try:
         return dq_engine_service.save_preview_as_new_version(
             db=db,
@@ -69,12 +67,12 @@ def save_run(dataset_id: int, payload: SavePayload, db: Session = Depends(get_db
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Save failed: {str(e)}")
 
-
 @router.get("/{dataset_id}/runs/{run_id}/download")
 def download_preview_csv(dataset_id: int, run_id: int, db: Session = Depends(get_db)):
+    """Download preview results as CSV"""
     try:
         path = dq_engine_service.get_preview_file_path(db, dataset_id, run_id)
-        filename = f"dataset_{dataset_id}_dq_preview_run_{run_id}.csv"
+        filename = f"dataset_{dataset_id}_dq_preview_run{run_id}.csv"
         return FileResponse(path, media_type="text/csv", filename=filename)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))

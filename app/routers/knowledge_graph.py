@@ -1,42 +1,42 @@
-# python-backend/app/routers/knowledge_graph_team.py
-
+"""
+python-backend/app/routers/knowledge_graph.py
+Knowledge Graph endpoints for automatic relationship discovery
+"""
 import os
 from fastapi import APIRouter, Depends, Body
 from pydantic import BaseModel
 from typing import List
 from sqlalchemy.orm import Session
 from azure.storage.blob import BlobServiceClient
-
 from app.database import SessionLocal
 from app.services.knowledge_graph import KnowledgeGraphService
 
 router = APIRouter()
 
-
 # ── Standard db dependency — same pattern as every other router in this project ──
 def get_db():
+    """Database session dependency"""
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
 
-
 @router.post("/knowledge-graph")
 def get_knowledge_graph(
     dataset_ids: List[int] = Body(...),   # Body(...) accepts raw JSON array [1, 2, 3]
     db: Session = Depends(get_db),        # get_db() yields — Depends works correctly
 ):
+    """Build knowledge graph for specified datasets"""
     service = KnowledgeGraphService()
     return service.build_graph(dataset_ids, db)
-
 
 class FolderRequest(BaseModel):
     folder: str
 
-
 @router.post("/knowledge-graph/folder")
 def get_kg_from_folder(req: FolderRequest):
+    """Build knowledge graph from folder in Azure Blob"""
     try:
         service = KnowledgeGraphService()
         return service.build_graph_from_folder(req.folder)
@@ -46,7 +46,6 @@ def get_kg_from_folder(req: FolderRequest):
         if "Missing credentials" in err or "AZURE_OPENAI" in err or "api_key" in err:
             return {"nodes": [], "edges": [], "error": "LLM not configured — set AZURE_OPENAI_API_KEY in app.yaml"}
         raise
-
 
 @router.get("/folders")
 def list_folders():
