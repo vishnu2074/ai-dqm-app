@@ -1,28 +1,30 @@
 """
 python-backend/app/routers/profiling_detail.py
- 
+
 GET  /{dataset_id}/profile  — page-load fetch, no new run
 POST /{dataset_id}/run      — triggers run_dq_scoring (same as DQ Scores Run button)
+
+FIXED: Scheduler now handles missing tables gracefully (governance_system_config, datasets)
 """
- 
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
- 
+
 from app.database import SessionLocal
 from app.services.profiling_detail import run_detail_profiling, get_detail_profile
 from app.routers.quality_snapshots import record_snapshot
- 
+
 router = APIRouter()
- 
- 
+
+
 def get_db():
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
- 
- 
+
+
 @router.get("/{dataset_id}/profile")
 def get_profile(dataset_id: int, db: Session = Depends(get_db)):
     """
@@ -35,8 +37,8 @@ def get_profile(dataset_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Profile fetch failed: {str(e)}")
- 
- 
+
+
 @router.post("/{dataset_id}/run")
 def run_profiling(dataset_id: int, db: Session = Depends(get_db)):
     """
@@ -46,7 +48,7 @@ def run_profiling(dataset_id: int, db: Session = Depends(get_db)):
     """
     try:
         result = run_detail_profiling(db, dataset_id)
- 
+
         # Auto-record today's quality snapshot so the trend chart stays current
         try:
             record_snapshot(dataset_id)
@@ -82,14 +84,14 @@ def run_profiling(dataset_id: int, db: Session = Depends(get_db)):
         except Exception as _e:
             print(f"[delta_sync] profiling mirror failed (non-fatal): {_e}")
         # ────────────────────────────────────────────────────────────────────
- 
+
         try:
             from app.routers.notification_inbox_routes import create_inbox_notification
             from app.models import Dataset
- 
+
             ds = db.query(Dataset).filter(Dataset.id == dataset_id).first()
             ds_name = (ds.display_name or ds.physical_name or f"Dataset {dataset_id}") if ds else f"Dataset {dataset_id}"
- 
+
             create_inbox_notification(
                 title=f"Profiling Completed: {ds_name}",
                 message=f"Data profiling run completed for '{ds_name}'. Check the profiling dashboard for results.",
@@ -100,19 +102,20 @@ def run_profiling(dataset_id: int, db: Session = Depends(get_db)):
             )
         except Exception:
             pass
- 
+
         return result
- 
+
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Profiling run failed: {str(e)}")
- 
- 
+
+
 # Keep backward-compat alias used by old frontend versions
 @router.get("/{dataset_id}/statistical-profile")
 def get_statistical_profile(dataset_id: int, db: Session = Depends(get_db)):
     return get_profile(dataset_id, db)
+
 
 # ── Background scheduler ──────────────────────────────────────────────────────
 # Runs in a daemon thread — checks every minute whether any dataset is due
@@ -120,6 +123,7 @@ def get_statistical_profile(dataset_id: int, db: Session = Depends(get_db)):
 
 import threading
 import time as _time
+
 
 def _run_profiling_for_dataset(dataset_id: int):
     """Fire a profiling run for a single dataset (called from scheduler thread)."""
@@ -136,20 +140,33 @@ def _run_profiling_for_dataset(dataset_id: int):
 
 
 def _scheduler_loop():
-    """Daemon loop — runs forever, checks for due profiling jobs every 60s."""
+    """
+    Daemon loop — runs forever, checks for due profiling jobs every 60s.
+    FIXED: Now handles missing tables gracefully (governance_system_config, datasets).
+    """
     print("[scheduler] Background profiling scheduler started")
     while True:
         try:
-            from app.database import SessionLocal, engine
+            from app.database import engine
             from sqlalchemy import text
 
-            with engine.connect() as conn:
-                # Get all datasets with their schedule config
-                schedule_val = conn.execute(
-                    text("SELECT value FROM governance_system_config WHERE key='dq_scoring_schedule'")
-                ).scalar()
-                schedule = (schedule_val or "daily").strip().lower()
+            # ── Get schedule config (handle missing table) ────────────────────
+            schedule = "daily"  # default
+            try:
+                with engine.connect() as conn:
+                    schedule_val = conn.execute(
+                        text("SELECT value FROM governance_system_config WHERE key='dq_scoring_schedule'")
+                    ).scalar()
+                    if schedule_val:
+                        schedule = schedule_val.strip().lower()
+            except Exception as config_err:
+                # Table doesn't exist yet or other error — use default
+                if "no such table" in str(config_err).lower():
+                    print(f"[scheduler] governance_system_config table not found, using default schedule: {schedule}")
+                else:
+                    print(f"[scheduler] Error reading schedule config: {config_err}")
 
+            # ── Determine if we should run now ────────────────────────────────
             now = _time.localtime()
             should_run = False
 
@@ -161,14 +178,22 @@ def _scheduler_loop():
                 should_run = (now.tm_wday == 0 and now.tm_hour == 2 and now.tm_min == 0)  # Monday 2 AM
             # "manual" or anything else → never auto-run
 
+            # ── Get datasets to profile (handle missing table) ────────────────
             if should_run:
-                from app.database import engine
-                from sqlalchemy import text as _text
-                with engine.connect() as conn:
-                    dataset_ids = [
-                        row[0] for row in
-                        conn.execute(_text("SELECT id FROM datasets")).fetchall()
-                    ]
+                dataset_ids = []
+                try:
+                    with engine.connect() as conn:
+                        dataset_ids = [
+                            row[0] for row in
+                            conn.execute(text("SELECT id FROM datasets")).fetchall()
+                        ]
+                except Exception as ds_err:
+                    if "no such table" in str(ds_err).lower():
+                        print(f"[scheduler] datasets table not found, skipping scheduled run")
+                    else:
+                        print(f"[scheduler] Error reading datasets: {ds_err}")
+
+                # ── Fire profiling runs for each dataset ──────────────────────
                 for did in dataset_ids:
                     threading.Thread(
                         target=_run_profiling_for_dataset,
