@@ -94,8 +94,17 @@ def _introspect(conn) -> dict:
     pr_completed = [s for s in pr_statuses if s.lower() in completed_keywords]
     pr_failed = [s for s in pr_statuses if s.lower() in failed_keywords]
     if not pr_completed and pr_statuses: pr_completed = [s for s in pr_statuses if s not in pr_failed]
-    pr_completed_filter = _in_clause("status", pr_completed)
-    pr_failed_filter = _in_clause("status", pr_failed)
+    # If the table is empty OR all rows have NULL status, fall back to COUNT(*) so
+    # metrics still reflect the real row counts (0) instead of silently 1=0-ing.
+    if not pr_completed and not pr_statuses:
+        # Table is empty or all statuses are NULL — treat every row as "completed"
+        pr_completed_filter = "1=1"
+    elif not pr_completed:
+        # Statuses exist but none matched known completed keywords — use all non-failed
+        pr_completed_filter = _in_clause("status", list(pr_statuses - set(pr_failed)))
+    else:
+        pr_completed_filter = _in_clause("status", pr_completed)
+    pr_failed_filter = _in_clause("status", pr_failed) if pr_failed else "1=0"
 
     dq_statuses = set()
     if _table_exists(conn, "dq_rules"):
@@ -103,7 +112,12 @@ def _introspect(conn) -> dict:
         dq_statuses = {r["status"] for r in rows}
     dq_active = [s for s in dq_statuses if s.lower() in {'active', 'enabled', 'on', 'true', '1'}]
     if not dq_active and dq_statuses: dq_active = [s for s in dq_statuses if s.lower() not in {'inactive', 'disabled', 'off', 'false', '0', 'deleted', 'archived'}]
-    dq_active_filter = _in_clause("status", dq_active)
+    if not dq_active and not dq_statuses:
+        dq_active_filter = "1=1"
+    elif not dq_active:
+        dq_active_filter = "1=1"  # no inactive detected either — treat all as active
+    else:
+        dq_active_filter = _in_clause("status", dq_active)
 
     severity_dist = {}
     drift_has_severity = False
@@ -126,7 +140,7 @@ def _introspect(conn) -> dict:
             if candidate in tc_cols: tc_context_col = candidate; break
 
     pr_timestamp_col = None
-    for candidate in ("created_at", "started_at"):
+    for candidate in ("created_at", "started_at", "timestamp"):
         if candidate in pr_cols: pr_timestamp_col = candidate; break
 
     policy_table = "ai_policies" if _table_exists(conn, "ai_policies") else "governance_policies"
@@ -191,8 +205,11 @@ def _tab_global_ai_llm(conn, schema, dataset_id) -> dict:
         row_cp = _one(conn, f"SELECT COUNT(CASE WHEN ai_description IS NOT NULL AND TRIM(ai_description)!='' THEN 1 END) as has_ai, COUNT(*) as total FROM column_profiles WHERE 1=1 {ds_cp}", cp_p)
         has_ai = row_cp["has_ai"] if row_cp else 0; cp_total = row_cp["total"] if row_cp else 0
     else:
-        row_cp = _one(conn, f"SELECT COUNT(DISTINCT profiling_run_id) as with_prof FROM column_profiles WHERE 1=1 {ds_cp}", cp_p)
-        has_ai = row_cp["with_prof"] if row_cp else 0; cp_total = comp
+        # No ai_description column — we can't measure response relevance meaningfully
+        # but at least report the real profile count
+        row_cp = _one(conn, f"SELECT COUNT(*) as total FROM column_profiles WHERE 1=1 {ds_cp}", cp_p)
+        cp_total = row_cp["total"] if row_cp else 0
+        has_ai = 0  # genuinely unknown without the column
     rr_val = safe_pct(has_ai, cp_total); rr_status = _status(rr_val, healthy_ge=80, critical_lt=20)
     if schema["pr_has_ai_summary"]:
         row_sc = _one(conn, f"SELECT COUNT(CASE WHEN ai_summary IS NOT NULL AND LENGTH(TRIM(ai_summary))>50 THEN 1 END) as good, COUNT(CASE WHEN ai_summary IS NOT NULL AND TRIM(ai_summary)!='' THEN 1 END) as attempted FROM profiling_runs WHERE {comp_filter} {ds_pr}", pr_p)
@@ -264,8 +281,10 @@ def _tab_dq_scores(conn, schema, dataset_id) -> dict:
         recent_rows = _all(conn, f"SELECT {score_col} FROM quality_snapshots WHERE {score_col} IS NOT NULL {ds_qs} ORDER BY rowid DESC LIMIT 5", qs_p)
         recent = [r[0] for r in recent_rows if r[0] is not None]
         velocity = round(recent[0] - recent[-1], 4) if len(recent) >= 2 else None
-    else: velocity = None
-    hdv_status = ("healthy" if velocity == 0 else "warning" if velocity and velocity > 0 else "healthy" if velocity and velocity < 0 else "neutral")
+    else:
+        recent = []
+        velocity = None
+    hdv_status = ("neutral" if velocity is None else "healthy" if velocity >= 0 else "warning" if velocity > -10 else "critical")
     return {"tab": "DQ Scores", "metrics": [
         M("health_score_accuracy", "Health Score Accuracy", hsa_val, "%", hsa_status, "quality_snapshots WHERE score BETWEEN 0 AND 100 / total_snapshots × 100", {"valid": valid_snaps, "total": total_snaps}),
         M("rule_compliance_accuracy", "Rule Pass Rate", rca_val, "%", rca_status, "passed_rule_results / total_rule_results × 100", {"passed": passed, "total": rr_total}),
@@ -318,7 +337,8 @@ def _tab_monitoring_trends(conn, schema, dataset_id) -> dict:
         runs_last_7 = row_7["cnt"] if row_7 else 0; avg_per_day = round(runs_last_7 / 7, 2)
     else:
         row_total = _one(conn, f"SELECT COUNT(*) FROM profiling_runs WHERE 1=1 {ds_pr}", pr_p)
-        runs_last_7 = row_total[0] if row_total else 0; avg_per_day = round(runs_last_7 / 7, 2) if runs_last_7 > 0 else None
+        runs_last_7 = row_total[0] if row_total else 0
+        avg_per_day = round(runs_last_7 / 7, 2) if runs_last_7 > 0 else 0
     art_status = "healthy" if runs_last_7 > 0 else "critical"
     
     # FIX: Check for SIGNIFICANT drift type (from dq_scores.py) instead of MAJOR/CRITICAL
@@ -570,7 +590,7 @@ def _tab_system_platform(conn, schema, dataset_id) -> dict:
 def _tab_human_feedback(conn, schema, dataset_id) -> dict:
     policy_table = schema["policy_table"]
     if _table_exists(conn, policy_table):
-        row_pol = _one(conn, "SELECT COUNT(CASE WHEN LOWER(status) IN ('active','accepted') THEN 1 END) as accepted, COUNT(CASE WHEN LOWER(status) IN ('dismissed','rejected','inactive') THEN 1 END) as dismissed, COUNT(*) as total FROM {policy_table}")
+        row_pol = _one(conn, f"SELECT COUNT(CASE WHEN LOWER(status) IN ('active','accepted') THEN 1 END) as accepted, COUNT(CASE WHEN LOWER(status) IN ('dismissed','rejected','inactive') THEN 1 END) as dismissed, COUNT(*) as total FROM {policy_table}")
         accepted = row_pol["accepted"] if row_pol else 0; dismissed = row_pol["dismissed"] if row_pol else 0; pol_total = row_pol["total"] if row_pol else 0
     else: accepted, dismissed, pol_total = 0, 0, 0
     aar_val = safe_pct(accepted, accepted + dismissed); aar_status = _status(aar_val, healthy_ge=60, critical_lt=20)
