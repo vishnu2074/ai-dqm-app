@@ -145,9 +145,13 @@ def _introspect(conn) -> dict:
 
     policy_table = "ai_policies" if _table_exists(conn, "ai_policies") else "governance_policies"
     policy_sources = set()
+    pol_source_col = None
     if _table_exists(conn, policy_table):
-        rows = _all(conn, f"SELECT DISTINCT source FROM {policy_table}")
-        policy_sources = {r["source"] for r in rows if r["source"]}
+        pol_cols = _columns(conn, policy_table)
+        pol_source_col = next((c for c in ("source", "created_by", "origin", "policy_source", "type") if c in pol_cols), None)
+        if pol_source_col:
+            rows = _all(conn, f"SELECT DISTINCT {pol_source_col} FROM {policy_table}")
+            policy_sources = {r[0] for r in rows if r[0]}
 
     return {
         "pr_has_started_at": "started_at" in pr_cols, "pr_has_completed_at": "completed_at" in pr_cols,
@@ -160,7 +164,7 @@ def _introspect(conn) -> dict:
         "dr_has_dataset_id": "dataset_id" in dr_cols, "dr_has_run_id": any(c in dr_cols for c in ("profiling_run_id","run_id")),
         "severity_dist": severity_dist, "drift_has_severity": drift_has_severity, "drift_magnitude_col": drift_magnitude_col,
         "dq_active_filter": dq_active_filter, "dq_statuses": dq_statuses,
-        "policy_table": policy_table, "policy_sources": policy_sources,
+        "policy_table": policy_table, "policy_sources": policy_sources, "pol_source_col": pol_source_col,
     }
 
 def _duration_stats(conn, schema, dataset_id=None) -> dict:
@@ -303,13 +307,19 @@ def _tab_dq_rules(conn, schema, dataset_id) -> dict:
         executed = row_exec["executed"] if row_exec else 0
     else: executed = 0
     resr_val = safe_pct(executed, active_rules); resr_status = _status(resr_val, healthy_ge=80, critical_lt=30)
-    ai_sources = schema["policy_sources"]; ai_source_vals = ai_sources or {"llm", "ai", "gpt", "openai"}
-    in_clause = _in_clause("source", ai_source_vals)
-    row_ai = _one(conn, f"SELECT COUNT(CASE WHEN {active_filter} THEN 1 END) as accepted, COUNT(*) as suggested FROM dq_rules WHERE {in_clause} {ds_r}", r_p)
-    ai_accepted = row_ai["accepted"] if row_ai else 0; ai_suggested = row_ai["suggested"] if row_ai else 0
+    dq_rule_cols = _columns(conn, "dq_rules")
+    # Dynamically find the source/origin column for AI-rule detection
+    ai_source_col = next((c for c in ("source", "created_by", "origin", "rule_source", "type") if c in dq_rule_cols), None)
+    ai_sources = schema["policy_sources"]; ai_source_vals = ai_sources or {"llm", "ai", "gpt", "openai", "claude", "generated", "auto"}
+    if ai_source_col:
+        in_clause = _in_clause(ai_source_col, ai_source_vals)
+        row_ai = _one(conn, f"SELECT COUNT(CASE WHEN {active_filter} THEN 1 END) as accepted, COUNT(*) as suggested FROM dq_rules WHERE {in_clause} {ds_r}", r_p)
+        ai_accepted = row_ai["accepted"] if row_ai else 0; ai_suggested = row_ai["suggested"] if row_ai else 0
+    else:
+        ai_accepted, ai_suggested = 0, 0
     rrar_val = safe_pct(ai_accepted, ai_suggested); rrar_status = _status(rrar_val, healthy_ge=70, critical_lt=20)
-    if ai_suggested > 0 and rr_rule_col:
-        row_never = _one(conn, f"SELECT COUNT(*) as never_run FROM dq_rules r WHERE {in_clause} AND NOT EXISTS (SELECT 1 FROM dq_rule_runs rr WHERE rr.rule_id = r.id) {ds_r}", r_p)
+    if ai_suggested > 0 and rr_rule_col and ai_source_col:
+        row_never = _one(conn, f"SELECT COUNT(*) as never_run FROM dq_rules r WHERE {_in_clause(ai_source_col, ai_source_vals)} AND NOT EXISTS (SELECT 1 FROM dq_rule_runs rr WHERE rr.rule_id = r.id) {ds_r}", r_p)
         never_run = row_never["never_run"] if row_never else 0
     else: never_run = 0
     hrr_val = safe_pct(never_run, ai_suggested); hrr_status = _status(hrr_val, healthy_le=10, critical_gt=50) if hrr_val is not None else "neutral"
@@ -349,10 +359,23 @@ def _tab_monitoring_trends(conn, schema, dataset_id) -> dict:
         ddp_val = safe_pct(significant, drift_total); ddp_unit = "%"; ddp_formula = "LOWER(severity) IN ('medium','high','critical') drift_records / total × 100"
         ddp_status = _status(ddp_val, healthy_ge=1, critical_lt=1) if drift_total > 0 else "neutral"
     elif "drift_type" in dr_cols:
-        row_drift = _one(conn, f"SELECT COUNT(CASE WHEN UPPER(drift_type) IN ('SIGNIFICANT','TYPE_CHANGE') THEN 1 END) as significant, COUNT(*) as total FROM drift_records WHERE 1=1 {ds_dr}", dr_p)
-        significant = row_drift["significant"] if row_drift else 0; drift_total = row_drift["total"] if row_drift else 0
-        ddp_val = safe_pct(significant, drift_total); ddp_unit = "%"; ddp_formula = "UPPER(drift_type) IN ('SIGNIFICANT','TYPE_CHANGE') drift_records / total × 100"
-        ddp_status = _status(ddp_val, healthy_ge=1, critical_lt=1) if drift_total > 0 else "neutral"
+        # Introspect the actual distinct drift_type values to build a dynamic filter
+        dtype_rows = _all(conn, "SELECT DISTINCT drift_type FROM drift_records WHERE drift_type IS NOT NULL")
+        dtype_vals = {r[0] for r in dtype_rows}
+        high_sev_types = {v for v in dtype_vals if any(k in v.upper() for k in ("SIGNIF", "TYPE_CHANGE", "HIGH", "CRITICAL", "MAJOR", "SEVERE"))}
+        if not high_sev_types:
+            # No high-severity labels at all → count all drift records as "detected", not a precision issue
+            row_drift = _one(conn, f"SELECT COUNT(*) as total FROM drift_records WHERE 1=1 {ds_dr}", dr_p)
+            drift_total = row_drift["total"] if row_drift else 0
+            significant = drift_total; ddp_val = float(drift_total); ddp_unit = "events"
+            ddp_formula = "Total drift records (no high-severity type classification)"
+            ddp_status = "healthy" if drift_total > 0 else "neutral"
+        else:
+            in_types = _in_clause("UPPER(drift_type)", {v.upper() for v in high_sev_types})
+            row_drift = _one(conn, f"SELECT COUNT(CASE WHEN {in_types} THEN 1 END) as significant, COUNT(*) as total FROM drift_records WHERE 1=1 {ds_dr}", dr_p)
+            significant = row_drift["significant"] if row_drift else 0; drift_total = row_drift["total"] if row_drift else 0
+            ddp_val = safe_pct(significant, drift_total); ddp_unit = "%"; ddp_formula = f"High-severity drift_type / total × 100 (types: {', '.join(sorted(high_sev_types)[:3])})"
+            ddp_status = "healthy" if ddp_val is not None and ddp_val < 30 else "warning" if ddp_val is not None else "neutral"
     elif schema["drift_magnitude_col"]:
         mag_col = schema["drift_magnitude_col"]
         row_drift = _one(conn, f"SELECT COUNT(CASE WHEN ABS({mag_col}) > 0.1 THEN 1 END) as significant, COUNT(*) as total FROM drift_records WHERE 1=1 {ds_dr}", dr_p)
@@ -367,13 +390,19 @@ def _tab_monitoring_trends(conn, schema, dataset_id) -> dict:
         significant = drift_total
 
     dr_has_created = "created_at" in dr_cols
-    if ts_col and _table_exists(conn, "drift_records") and dr_has_created:
+    if _table_exists(conn, "drift_records") and dr_has_created:
         row_last7 = _one(conn, f"SELECT COUNT(*) as cnt FROM drift_records WHERE created_at >= ? {ds_dr}", [cutoff_7d] + dr_p)
         row_prev7 = _one(conn, f"SELECT COUNT(*) as cnt FROM drift_records WHERE created_at >= ? AND created_at < ? {ds_dr}", [cutoff_14d, cutoff_7d] + dr_p)
         last7 = row_last7["cnt"] if row_last7 else 0; prev7 = row_prev7["cnt"] if row_prev7 else 0
-        trend = round(((last7 - prev7) / max(prev7, 1)) * 100, 1) if prev7 > 0 else None
-        dvt_status = ("healthy" if trend is not None and trend < 0 else "warning" if trend is not None and trend > 50 else "neutral")
-    else: last7, prev7, trend = 0, 0, None; dvt_status = "neutral"
+        if prev7 > 0:
+            trend = round(((last7 - prev7) / prev7) * 100, 1)
+            dvt_status = "healthy" if trend < 0 else "warning" if trend > 50 else "neutral"
+        elif last7 > 0:
+            trend = None; dvt_status = "warning"  # new drift in last 7d, no prior baseline
+        else:
+            trend = None; dvt_status = "neutral"
+    else:
+        last7, prev7, trend = 0, 0, None; dvt_status = "neutral"
     qs_cols = _columns(conn, "quality_snapshots")
     score_col = next((c for c in ("score", "health_score", "quality_score") if c in qs_cols), None)
     ds_qs = "AND dataset_id = ?" if dataset_id else ""; qs_p = [dataset_id] if dataset_id else []
@@ -463,7 +492,9 @@ def _tab_knowledge_graph(conn, schema, dataset_id) -> dict:
         row_col = _one(conn, f"SELECT COUNT(*) as col_edges FROM knowledge_graph_edges WHERE LOWER({edge_type_col}) LIKE '%column%'")
         col_edges = row_col["col_edges"] if row_col else 0
     else: col_edges = 0
-    kgcma_val = safe_pct(col_edges, cp_distinct); kgcma_status = _status(kgcma_val, healthy_ge=50, critical_lt=10)
+    # Only compute coverage ratio when KG has data; otherwise null avoids false 0%
+    kgcma_val = safe_pct(col_edges, cp_distinct) if kg_total > 0 else None
+    kgcma_status = _status(kgcma_val, healthy_ge=50, critical_lt=10)
     if conf_col and kg_total > 0:
         row_unc = _one(conn, f"SELECT COUNT(CASE WHEN {conf_col} IS NULL THEN 1 END) as unscored FROM knowledge_graph_edges")
         unscored = row_unc["unscored"] if row_unc else 0
@@ -490,14 +521,18 @@ def _tab_dq_assistant(conn, schema, dataset_id) -> dict:
         good_msgs = row_msg["good"] if row_msg else 0; msg_total = row_msg["total"] if row_msg else 0
     else: good_msgs, msg_total = 0, ni_total
     ncr_val = safe_pct(good_msgs, msg_total); ncr_status = _status(ncr_val, healthy_ge=90, critical_lt=50)
-    action_col = next((c for c in ("action_taken","actioned","resolved") if c in gn_cols), None)
+    action_col = next((c for c in ("action_taken","actioned","resolved","is_actioned","is_resolved") if c in gn_cols), None)
     row_gn = _one(conn, "SELECT COUNT(*) FROM governance_notifications") if _table_exists(conn, "governance_notifications") else None
     gn_total = row_gn[0] if row_gn else 0
-    all_notif = _scalar(conn, "SELECT COUNT(*) FROM (SELECT id FROM notification_inbox UNION ALL SELECT id FROM governance_notifications)", default=gn_total)
-    if action_col:
-        row_act = _one(conn, f"SELECT COUNT(CASE WHEN {action_col}=1 OR LOWER({action_col})='true' THEN 1 END) as actioned FROM governance_notifications")
+    all_notif = _scalar(conn, "SELECT COUNT(*) FROM (SELECT id FROM notification_inbox UNION ALL SELECT id FROM governance_notifications)", default=ni_total + gn_total)
+    if action_col and gn_total > 0:
+        row_act = _one(conn, f"SELECT COUNT(CASE WHEN {action_col}=1 OR LOWER(CAST({action_col} AS TEXT))='true' THEN 1 END) as actioned FROM governance_notifications")
         actioned = row_act["actioned"] if row_act else 0; aas_val = safe_pct(actioned, gn_total)
-    else: aas_val = safe_pct(gn_total, max(all_notif, 1)); actioned = gn_total
+    elif gn_total > 0:
+        # No action column — we know governance notifications exist but can't measure resolution
+        actioned = 0; aas_val = None
+    else:
+        actioned = 0; aas_val = None
     aas_status = _status(aas_val, healthy_ge=60, critical_lt=20)
     
     # FIX: Check 'dataset' column first (TEXT, has values like 'test2.csv'), fallback to 'dataset_id' (Integer FK, often NULL)
@@ -528,11 +563,15 @@ def _tab_dq_assistant(conn, schema, dataset_id) -> dict:
 
 def _tab_governance(conn, schema, dataset_id) -> dict:
     policy_table = schema["policy_table"]; policy_sources = schema["policy_sources"]
-    ai_candidates = policy_sources or {"llm", "ai", "gpt", "openai", "generated"}
-    in_cl = _in_clause("source", ai_candidates)
+    pol_source_col = schema.get("pol_source_col")
+    ai_candidates = policy_sources or {"llm", "ai", "gpt", "openai", "claude", "generated", "auto"}
     if _table_exists(conn, policy_table):
-        row_pol = _one(conn, f"SELECT COUNT(CASE WHEN LOWER(status) IN ('active','accepted','enabled') THEN 1 END) as accepted, COUNT(*) as suggested FROM {policy_table} WHERE {in_cl}")
-        accepted = row_pol["accepted"] if row_pol else 0; suggested = row_pol["suggested"] if row_pol else 0
+        if pol_source_col:
+            in_cl = _in_clause(pol_source_col, ai_candidates)
+            row_pol = _one(conn, f"SELECT COUNT(CASE WHEN LOWER(status) IN ('active','accepted','enabled') THEN 1 END) as accepted, COUNT(*) as suggested FROM {policy_table} WHERE {in_cl}")
+            accepted = row_pol["accepted"] if row_pol else 0; suggested = row_pol["suggested"] if row_pol else 0
+        else:
+            accepted, suggested = 0, 0
         row_all = _one(conn, f"SELECT COUNT(*) FROM {policy_table}"); pol_total = row_all[0] if row_all else 0
     else: accepted, suggested, pol_total = 0, 0, 0
     par_val = safe_pct(accepted, suggested); par_status = _status(par_val, healthy_ge=70, critical_lt=20)
@@ -549,8 +588,9 @@ def _tab_governance(conn, schema, dataset_id) -> dict:
         row_al = _one(conn, "SELECT COUNT(*) as entries FROM governance_audit_log"); audit_entries = row_al["entries"] if row_al else 0
     else: audit_entries = 0
     total_rules_created = _scalar(conn, "SELECT COUNT(*) FROM dq_rules", default=0)
-    total_labels = classified; total_pol_actions = accepted + (pol_total - suggested)
-    expected_audit = max(total_rules_created + total_labels + total_pol_actions, 1)
+    # Only count rules created + governance policy actions (NOT column labels — those are schema-time ops, not auditable events)
+    total_pol_actions = accepted + max(pol_total - suggested, 0)
+    expected_audit = max(total_rules_created + total_pol_actions, 1)
     alc_val = safe_pct(audit_entries, expected_audit); alc_val = min(alc_val, 100.0) if alc_val is not None else None
     alc_status = _status(alc_val, healthy_ge=70, critical_lt=20)
     return {"tab": "Governance & Settings", "metrics": [
@@ -572,7 +612,8 @@ def _tab_system_platform(conn, schema, dataset_id) -> dict:
                 t_first = datetime.fromisoformat(rows_ts[0][0].replace("Z", "+00:00"))
                 t_last = datetime.fromisoformat(rows_ts[-1][0].replace("Z", "+00:00"))
                 elapsed_h = (t_last - t_first).total_seconds() / 3600
-                throughput = round(len(rows_ts) / elapsed_h, 3) if elapsed_h > 0 else 0
+                # Require at least 1 minute of elapsed time to avoid division near zero
+                throughput = round(len(rows_ts) / elapsed_h, 3) if elapsed_h >= (1/60) else 0
             except Exception: throughput = 0
         else: throughput = 0
     else: throughput = 0
@@ -638,11 +679,20 @@ async def get_health_metrics(dataset_id: Optional[str] = Query(None)):
 async def debug_schema_inspection():
     try:
         conn = _conn(); schema = _introspect(conn)
-        samples = {}
-        for tbl in ["profiling_runs", "dq_rules", "drift_records", "temporal_checks", "notification_inbox"]:
+        # Expose serialisable schema (sets → sorted lists)
+        schema_out = {k: (sorted(v) if isinstance(v, set) else v) for k, v in schema.items()}
+        table_info = {}
+        for tbl in ["profiling_runs", "dq_rules", "drift_records", "temporal_checks",
+                    "notification_inbox", "governance_notifications", "governance_policies",
+                    "quality_snapshots", "column_profiles", "dq_rule_runs", "governance_audit_log",
+                    "lineage_edges", "knowledge_graph_edges", "datasets"]:
             if _table_exists(conn, tbl):
-                rows = _all(conn, f"SELECT * FROM {tbl} LIMIT 3")
-                samples[tbl] = [{k: r[k] for k in r.keys()} for r in rows]
+                cols = list(_columns(conn, tbl))
+                count = _scalar(conn, f"SELECT COUNT(*) FROM {tbl}", default=0)
+                rows = _all(conn, f"SELECT * FROM {tbl} LIMIT 2")
+                samples = [{k: r[k] for k in r.keys()} for r in rows]
+                table_info[tbl] = {"columns": sorted(cols), "row_count": count, "samples": samples}
         conn.close()
-        return {"schema": schema, "samples": samples}
-    except Exception as e: return {"error": str(e)}
+        return {"schema": schema_out, "tables": table_info}
+    except Exception as e:
+        return {"error": str(e)}
