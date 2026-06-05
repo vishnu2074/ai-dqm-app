@@ -38,33 +38,6 @@ def api_health():
         "python": sys.version,
     }
 
-@app.post("/admin/reset-database")
-async def reset_database():
-    """Reset database - deletes all data and recreates tables"""
-    import os
-    from pathlib import Path
-    
-    db_path = os.getenv("DB_PATH", "/tmp/ai-dqm/ai_dqm.db")
-    
-    # Close all connections first
-    from app.database import engine
-    engine.dispose()
-    
-    # Delete the file
-    if os.path.exists(db_path):
-        os.remove(db_path)
-        print(f"✓ Deleted database at {db_path}")
-    
-    # Recreate tables
-    from app.database import Base
-    Base.metadata.create_all(bind=engine)
-    
-    return {
-        "status": "ok",
-        "message": "Database reset successfully",
-        "db_path": db_path
-    }
-
 @app.post("/api/backup-db", include_in_schema=False)
 def backup_db():
     try:
@@ -80,9 +53,10 @@ try:
     from app.database import engine, Base, seed_governance_data
 
     def _bootstrap_sqlite_schema():
+        """All DB schema operations happen inside this function."""
         try:
             with engine.connect() as conn:
-                # ── 1. dq_rules columns ──────────────────────────────────────
+                # ── dq_rules columns ──────────────────────────────────────────
                 exists = conn.execute(
                     text("SELECT name FROM sqlite_master WHERE type='table' AND name='dq_rules'")
                 ).fetchone()
@@ -98,7 +72,7 @@ try:
                         if col not in existing:
                             conn.exec_driver_sql(f"ALTER TABLE dq_rules ADD COLUMN {col} {defn}")
 
-                # ── 2. profiling_runs columns ────────────────────────────────
+                # ── profiling_runs columns ────────────────────────────────────
                 pr_exists = conn.execute(
                     text("SELECT name FROM sqlite_master WHERE type='table' AND name='profiling_runs'")
                 ).fetchone()
@@ -119,7 +93,7 @@ try:
                             except Exception as col_err:
                                 _STARTUP_ERRORS.append(f"add_col_pr_{col}: {col_err}")
 
-                    # ── LEGITIMATE BACKFILL: Reconstruct timestamps ──────────
+                    # ── Backfill started_at from timestamp ────────────────────
                     try:
                         null_check = conn.execute(
                             text("SELECT COUNT(*) FROM profiling_runs WHERE started_at IS NULL AND timestamp IS NOT NULL")
@@ -140,15 +114,19 @@ try:
                                     started_at,
                                     '+' || MAX(1, CAST(ROUND(COALESCE(duration_ms, 1000) / 1000.0) AS INTEGER)) || ' seconds'
                                 )
-                                WHERE completed_at IS NULL AND started_at IS NOT NULL AND timestamp IS NOT NULL
+                                WHERE completed_at IS NULL
+                                   AND started_at IS NOT NULL
+                                   AND timestamp IS NOT NULL
                             """)
 
                             conn.commit()
                             print("[bootstrap] ✓ Timestamp backfill complete")
+
                     except Exception as backfill_err:
                         _STARTUP_ERRORS.append(f"timestamp_backfill: {backfill_err}")
+                        print(f"[bootstrap] ✗ Timestamp backfill failed: {backfill_err}")
 
-                # ── 3. column_profiles columns ───────────────────────────────
+                # ── column_profiles columns ───────────────────────────────────
                 cp_exists = conn.execute(
                     text("SELECT name FROM sqlite_master WHERE type='table' AND name='column_profiles'")
                 ).fetchone()
@@ -167,7 +145,7 @@ try:
                             except Exception as cp_err:
                                 _STARTUP_ERRORS.append(f"add_col_cp_{col}: {cp_err}")
 
-                # ── 4. drift_records created_at column ───────────────────────
+                # ── drift_records created_at column ───────────────────────────
                 dr_exists = conn.execute(
                     text("SELECT name FROM sqlite_master WHERE type='table' AND name='drift_records'")
                 ).fetchone()
@@ -193,8 +171,9 @@ try:
                             print("[bootstrap] ✓ drift_records.created_at backfill complete")
                         except Exception as dr_err:
                             _STARTUP_ERRORS.append(f"drift_created_at: {dr_err}")
+                            print(f"[bootstrap] ✗ drift_records.created_at failed: {dr_err}")
 
-                # ── 5. notification_inbox: add missing columns ───────────────
+                # ── notification_inbox columns ────────────────────────────────
                 ni_exists = conn.execute(
                     text("SELECT name FROM sqlite_master WHERE type='table' AND name='notification_inbox'")
                 ).fetchone()
@@ -216,21 +195,9 @@ try:
                                 conn.exec_driver_sql(f"ALTER TABLE notification_inbox ADD COLUMN {col} {defn}")
                                 print(f"[bootstrap] Added column notification_inbox.{col}")
                             except Exception:
-                                pass  # Column might already exist
+                                pass  # Column already exists
 
-                    # Copy created_at to timestamp for existing rows
-                    if "timestamp" in ni_existing or "created_at" in ni_existing:
-                        try:
-                            conn.exec_driver_sql("""
-                                UPDATE notification_inbox
-                                SET timestamp = created_at
-                                WHERE timestamp IS NULL AND created_at IS NOT NULL
-                            """)
-                            conn.commit()
-                        except Exception:
-                            pass
-
-                # ── 6. Create governance_system_config table if missing ──────
+                # ── governance_system_config table ────────────────────────────
                 gsc_exists = conn.execute(
                     text("SELECT name FROM sqlite_master WHERE type='table' AND name='governance_system_config'")
                 ).fetchone()
@@ -246,26 +213,35 @@ try:
                             )
                         """)
                         print("[bootstrap] ✓ Created governance_system_config table")
-
-                        # Insert default config values
-                        default_configs = [
-                            ("dq_scoring_schedule", "daily", "Schedule for automatic DQ scoring: hourly, daily, weekly, manual"),
-                            ("email_notifications_enabled", "false", "Enable email notifications for alerts"),
-                            ("slack_webhook_url", "", "Slack webhook URL for notifications"),
-                            ("max_profiling_rows", "1000000", "Maximum rows to process in a single profiling run"),
-                        ]
-                        for key, value, desc in default_configs:
-                            conn.exec_driver_sql("""
-                                INSERT OR IGNORE INTO governance_system_config (key, value, description)
-                                VALUES (:key, :value, :desc)
-                            """, {"key": key, "value": value, "desc": desc})
-                        conn.commit()
                     except Exception as gsc_err:
                         _STARTUP_ERRORS.append(f"governance_system_config: {gsc_err}")
+
+                # ── governance_audit_log table ────────────────────────────────
+                gal_exists = conn.execute(
+                    text("SELECT name FROM sqlite_master WHERE type='table' AND name='governance_audit_log'")
+                ).fetchone()
+                if not gal_exists:
+                    try:
+                        conn.exec_driver_sql("""
+                            CREATE TABLE governance_audit_log (
+                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                action TEXT NOT NULL,
+                                user_id TEXT,
+                                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                                details TEXT,
+                                dataset_id INTEGER,
+                                resource_type TEXT,
+                                resource_id TEXT
+                            )
+                        """)
+                        print("[bootstrap] ✓ Created governance_audit_log table")
+                    except Exception as gal_err:
+                        _STARTUP_ERRORS.append(f"governance_audit_log: {gal_err}")
 
                 conn.commit()
         except Exception as e:
             _STARTUP_ERRORS.append(f"schema_bootstrap: {e}")
+            print(f"[bootstrap] ✗ Schema bootstrap failed: {e}")
 
     from app import models  # noqa: F401
     Base.metadata.create_all(bind=engine)
@@ -278,8 +254,7 @@ try:
     except Exception as e:
         _STARTUP_ERRORS.append(f"periodic_backup: {e}")
 
-
-    # ── Extract real DB path ─────────────────────────────────────────────────
+    # ── Extract real DB path ──────────────────────────────────────────────────
     try:
         _db_url = str(engine.url)
         if _db_url.startswith("sqlite:////"):
@@ -304,32 +279,7 @@ except Exception as e:
     os.environ.setdefault("DB_PATH", "/tmp/ai-dqm/ai_dqm.db")
 
 
-# Add this AFTER the existing table creation code in _bootstrap_sqlite_schema():
-
-# ── governance_audit_log table ───────────────────────────────────────────
-gal_exists = conn.execute(
-    text("SELECT name FROM sqlite_master WHERE type='table' AND name='governance_audit_log'")
-).fetchone()
-if not gal_exists:
-    try:
-        conn.exec_driver_sql("""
-            CREATE TABLE governance_audit_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                action TEXT NOT NULL,
-                user_id TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                details TEXT,
-                dataset_id INTEGER,
-                resource_type TEXT,
-                resource_id TEXT
-            )
-        """)
-        print("[bootstrap] ✓ Created governance_audit_log table")
-    except Exception as gal_err:
-        _STARTUP_ERRORS.append(f"governance_audit_log: {gal_err}")
-
-        
-# ── LLM client factory ─────────────────────────────────────────────────────
+# ── LLM client factory (Azure AI Foundry — Llama 3.3 70B) ─────────────────────
 _llm_client_instance = None
 
 def get_llm_client():
@@ -337,7 +287,14 @@ def get_llm_client():
     if _llm_client_instance is not None:
         return _llm_client_instance
 
+    # FIX: Handle endpoint URL properly - remove trailing slashes and /v1 if present
     endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
+    # Remove /v1 or /openai/v1 if already present to avoid doubling
+    if endpoint.endswith("/v1"):
+        endpoint = endpoint[:-3]
+    if endpoint.endswith("/openai"):
+        endpoint = endpoint[:-7]
+    
     api_key = os.getenv("AZURE_OPENAI_API_KEY", "")
 
     if not endpoint or not api_key:
@@ -346,6 +303,7 @@ def get_llm_client():
 
     try:
         from openai import OpenAI
+        # Use /v1 path for Azure AI Foundry
         _llm_client_instance = OpenAI(
             base_url=f"{endpoint}/v1",
             api_key=api_key,
@@ -360,7 +318,7 @@ def get_llm_client():
 get_llm_client()
 
 
-# ── Router loader helper ────────────────────────────────────────────────────
+# ── Router loader helper ──────────────────────────────────────────────────────
 def _load(label: str, fn):
     try:
         fn()
@@ -371,7 +329,7 @@ def _load(label: str, fn):
         print(f"[router] ✗ {msg}")
 
 
-# ── Routers ─────────────────────────────────────────────────────────────────
+# ── Routers ───────────────────────────────────────────────────────────────────
 def _reg_datasources():
     from app.routers import datasources
     app.include_router(datasources.router, prefix="/datasources", tags=["datasources"])
@@ -498,7 +456,7 @@ def _reg_health_metrics():
 _load("health_metrics_router", _reg_health_metrics)
 
 
-# ── Frontend static files ───────────────────────────────────────────────────
+# ── Frontend static files ─────────────────────────────────────────────────────
 _THIS_FILE = _Path(__file__).resolve()
 _APP_DIR = _THIS_FILE.parent
 _SOURCE_ROOT = _APP_DIR.parent

@@ -20,7 +20,8 @@ from app.services.dq_scores import _load_dataframe_for_dataset
 
 
 class KnowledgeGraphService:
-    
+
+    # ── Key Classification ────────────────────────────────────────────────────
     def _classify_key(self, stats: dict) -> str:
         if not stats:
             return "unknown"
@@ -33,6 +34,7 @@ class KnowledgeGraphService:
             return "foreign"
         return "none"
 
+    # ── Node Builders ─────────────────────────────────────────────────────────
     def _make_table_node(self, nid: str, label: str) -> dict:
         return {"id": nid, "label": label, "type": "table"}
 
@@ -45,7 +47,9 @@ class KnowledgeGraphService:
             "key_type": self._classify_key(stats),
         }
 
+    # ── Edge Deduplication ────────────────────────────────────────────────────
     def _dedup_edges(self, edges: list) -> list:
+        """Keep only the highest-confidence edge per (source, target, src_col, tgt_col)."""
         structural = [e for e in edges if not e.get("relationship")]
         best: dict = {}
         for e in edges:
@@ -56,7 +60,9 @@ class KnowledgeGraphService:
                 best[key] = e
         return structural + list(best.values())
 
+    # ── Edge Limiting ─────────────────────────────────────────────────────────
     def _limit_edges_per_column(self, edges: list, max_edges: int = 3) -> list:
+        """Limit outgoing relationship edges per source column node."""
         count: dict = defaultdict(int)
         result = []
         for e in edges:
@@ -68,7 +74,9 @@ class KnowledgeGraphService:
                 count[e["source"]] += 1
         return result
 
+    # ── DataFrame Normalization ───────────────────────────────────────────────
     def _normalize_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Normalize ID columns to strings for consistent matching."""
         if df is None or df.empty:
             return df
         df_copy = df.copy()
@@ -81,7 +89,10 @@ class KnowledgeGraphService:
                 df_copy[col] = df_copy[col].replace('nan', pd.NA)
         return df_copy
 
-    def _validate_edge(self, rel_agent: RelationshipAgent, df1: pd.DataFrame, df2: pd.DataFrame, col1: str, col2: str) -> tuple:
+    # ── Edge Validation ───────────────────────────────────────────────────────
+    def _validate_edge(self, rel_agent: RelationshipAgent, df1: pd.DataFrame,
+                       df2: pd.DataFrame, col1: str, col2: str) -> tuple:
+        """Validate that two columns can form a valid relationship edge."""
         try:
             s1_raw = df1[col1].dropna()
             s2_raw = df2[col2].dropna()
@@ -103,7 +114,9 @@ class KnowledgeGraphService:
 
         return True, conf_max, relationship
 
+    # ── Layout Engine ─────────────────────────────────────────────────────────
     def _apply_layout(self, nodes: list, edges: list, is_folder: bool) -> tuple:
+        """Assign x,y coordinates to nodes for frontend rendering."""
         TABLE_Y = 150 if is_folder else -50
         COLUMN_Y_START = 250 if is_folder else 80
 
@@ -160,33 +173,38 @@ class KnowledgeGraphService:
         ]
         return final_nodes, edges
 
-    def _save_edges_to_db(self, db: Session, edges: list, dataset_map: dict):
-        """FIXED: Save discovered edges to knowledge_graph_edges table."""
+    # ── DB Persistence (FIXED) ────────────────────────────────────────────────
+    def _save_edges_to_db(self, db: Session, edges: list, dataset_map: dict) -> int:
+        """
+        Save discovered relationship edges to the knowledge_graph_edges table.
+        Only saves edges with a 'relationship' field (skips structural table→column edges).
+        Returns the number of edges saved.
+        """
         saved_count = 0
         for edge in edges:
             if not edge.get("relationship"):
                 continue  # Skip structural edges (table→column)
-            
+
             try:
                 # Extract dataset info from node IDs
                 source_node = edge["source"]
                 target_node = edge["target"]
-                
+
                 # Node IDs are like "dataset_name:column_name"
                 if ":" not in source_node or ":" not in target_node:
                     continue
-                
+
                 source_ds_name, source_col = source_node.split(":", 1)
                 target_ds_name, target_col = target_node.split(":", 1)
-                
+
                 # Get dataset IDs from map
                 source_ds_id = dataset_map.get(source_ds_name)
                 target_ds_id = dataset_map.get(target_ds_name)
-                
+
                 if not source_ds_id or not target_ds_id:
                     continue
-                
-                # Check if edge already exists
+
+                # Check if edge already exists (avoid duplicates)
                 existing = db.query(KnowledgeGraphEdge).filter_by(
                     source_dataset_id=source_ds_id,
                     source_column=source_col,
@@ -194,11 +212,11 @@ class KnowledgeGraphService:
                     target_column=target_col,
                     invalidated=False
                 ).first()
-                
+
                 if existing:
                     continue  # Skip duplicates
-                
-                # Create new edge
+
+                # Create new edge record
                 kg_edge = KnowledgeGraphEdge(
                     source_dataset_id=source_ds_id,
                     source_column=source_col,
@@ -216,21 +234,29 @@ class KnowledgeGraphService:
                 )
                 db.add(kg_edge)
                 saved_count += 1
-                
+
             except Exception as e:
                 print(f"[kg] Failed to save edge {edge.get('source')} → {edge.get('target')}: {e}")
                 continue
-        
+
         if saved_count > 0:
             db.commit()
             print(f"[kg] ✓ Saved {saved_count} edges to knowledge_graph_edges table")
-        
+
         return saved_count
 
-    def _build_core(self, db: Session, dataframes: dict, metadata_map: dict, llm_edges: list,
-                    node_id_fn, label_fn, rel_agent: RelationshipAgent,
-                    matching_agent: MatchingAgent, llm_agent: LLMAgent,
+    # ── Core Graph Builder ────────────────────────────────────────────────────
+    def _build_core(self, db: Session, dataframes: dict, metadata_map: dict,
+                    llm_edges: list, node_id_fn, label_fn,
+                    rel_agent: RelationshipAgent,
+                    matching_agent: MatchingAgent,
+                    llm_agent: LLMAgent,
                     dataset_map: dict) -> tuple:
+        """
+        Core graph building logic shared by both build_graph and build_graph_from_folder.
+        Discovers relationships via LLM suggestions + MatchingAgent fallback.
+        Saves discovered edges to DB via _save_edges_to_db.
+        """
         key_agent = KeyDetectionAgent()
         table_columns = {t: list(m.keys()) for t, m in metadata_map.items()}
         key_map = {t: key_agent.detect_keys(m) for t, m in metadata_map.items()}
@@ -272,7 +298,7 @@ class KnowledgeGraphService:
                 for e in edges if e.get("relationship")
             )
 
-        # PASS 1: LLM edges
+        # ── PASS 1: LLM-suggested edges ──────────────────────────────────────
         print(f"[KG] Processing {len(llm_edges)} LLM-suggested edges")
         for e in llm_edges:
             t1 = e.get("source", "")
@@ -299,10 +325,13 @@ class KnowledgeGraphService:
             s1 = _ensure_column(t1, c1, metadata_map.get(t1, {}).get(c1, {}))
             s2 = _ensure_column(t2, c2, metadata_map.get(t2, {}).get(c2, {}))
 
-            reason = e.get("reason") or f"{c1} and {c2} share {int(confidence*100)}% overlap indicating a {relationship} relationship."
+            reason = e.get("reason") or (
+                f"{c1} and {c2} share {int(confidence*100)}% overlap "
+                f"indicating a {relationship} relationship."
+            )
             _add_rel_edge(s1, s2, c1, c2, relationship, confidence, reason)
 
-        # PASS 2: MatchingAgent fallback
+        # ── PASS 2: MatchingAgent fallback ────────────────────────────────────
         print(f"[KG] Processing {len(matches)} MatchingAgent candidates")
         for m in matches:
             t1, t2 = m["table1"], m["table2"]
@@ -325,11 +354,14 @@ class KnowledgeGraphService:
             if _already_exists(s1, s2):
                 continue
 
-            reason = f"{c1} and {c2} share {int(confidence*100)}% value overlap indicating a {relationship} relationship."
+            reason = (
+                f"{c1} and {c2} share {int(confidence*100)}% value overlap "
+                f"indicating a {relationship} relationship."
+            )
             _add_rel_edge(s1, s2, c1, c2, relationship, confidence, reason)
             print(f"  ✅ Added relationship: {t1}.{c1} ↔ {t2}.{c2} ({relationship})")
 
-        # FIXED: Save edges to database
+        # ── FIXED: Save relationship edges to database ────────────────────────
         rel_edges = [e for e in edges if e.get("relationship")]
         if rel_edges:
             self._save_edges_to_db(db, rel_edges, dataset_map)
@@ -337,17 +369,22 @@ class KnowledgeGraphService:
         print(f"[KG] Final edges count: {len(edges)} (relationships: {len(rel_edges)})")
         return nodes_dict, edges
 
+    # ── Public API: Build from Selected Datasets ──────────────────────────────
     def build_graph(self, db: Session, dataset_ids: list) -> dict:
-        """Entry point for the SELECT DATASETS tab."""
+        """
+        Entry point for the SELECT DATASETS tab.
+        Loads datasets, discovers relationships, saves to DB, returns graph.
+        """
         file_paths: list = []
         datasets = db.query(Dataset).filter(Dataset.id.in_(dataset_ids)).all()
-        
+
         # Build dataset name → ID map for DB saving
         dataset_map = {}
         for ds in datasets:
             real_name = os.path.basename(ds.physical_name) if ds.physical_name else f"dataset_{ds.id}"
             dataset_map[real_name] = ds.id
 
+        # Load dataframes from datasets
         for ds in datasets:
             try:
                 df = _load_dataframe_for_dataset(db, ds.id)
@@ -364,12 +401,14 @@ class KnowledgeGraphService:
         if not file_paths:
             return {"nodes": [], "edges": [], "message": "No datasets loaded"}
 
+        # Build path and display maps
         path_map: dict = {real: temp for temp, real in file_paths}
         display_map: dict = {}
         for ds in datasets:
             real = os.path.basename(ds.physical_name) if ds.physical_name else f"dataset_{ds.id}"
             display_map[real] = ds.display_name or real
 
+        # Profile datasets
         profiler = ProfilingAgent()
         metadata_map = {}
         dataframes = {}
@@ -386,6 +425,7 @@ class KnowledgeGraphService:
                 print(f"[KG] Error loading dataframe {real_name}: {exc}")
                 dataframes[real_name] = pd.DataFrame()
 
+        # LLM pass for edge suggestions
         llm_agent = LLMAgent()
         llm_edges = llm_agent.generate_kg(metadata_map).get("edges", [])
 
@@ -398,8 +438,9 @@ class KnowledgeGraphService:
         def label_fn(real_name: str) -> str:
             return display_map.get(real_name, real_name)
 
+        # Build core graph (includes DB saving)
         nodes_dict, edges = self._build_core(
-            db=db,  # FIXED: Pass db session
+            db=db,
             dataframes=dataframes,
             metadata_map=metadata_map,
             llm_edges=llm_edges,
@@ -408,9 +449,10 @@ class KnowledgeGraphService:
             rel_agent=rel_agent,
             matching_agent=matching_agent,
             llm_agent=llm_agent,
-            dataset_map=dataset_map,  # FIXED: Pass dataset map
+            dataset_map=dataset_map,
         )
 
+        # Deduplicate and apply layout
         edges = self._dedup_edges(edges)
         nodes = list(nodes_dict.values())
         final_nodes, edges = self._apply_layout(nodes, edges, is_folder=False)
@@ -418,8 +460,14 @@ class KnowledgeGraphService:
         print(f"[KG] Final graph: {len(final_nodes)} nodes, {len(edges)} edges")
         return {"nodes": final_nodes, "edges": edges}
 
+    # ── Public API: Build from Azure Blob Folder ──────────────────────────────
     def build_graph_from_folder(self, folder_name: str) -> dict:
-        """Entry point for the SELECT FOLDER tab."""
+        """
+        Entry point for the SELECT FOLDER tab.
+        Loads CSVs from Azure Blob folder, discovers relationships.
+        Note: Folder mode creates a temporary DB session for saving edges,
+        but dataset_map is empty so edges won't be linked to specific datasets.
+        """
         connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
         container_name = "intern26"
 
@@ -447,6 +495,7 @@ class KnowledgeGraphService:
         if not local_files:
             return {"nodes": [], "edges": []}
 
+        # Profile and load dataframes
         profiler = ProfilingAgent()
         metadata_map = {}
         dataframes = {}
@@ -464,6 +513,7 @@ class KnowledgeGraphService:
                 print(f"[KG] Error loading {real_name}: {exc}")
                 dataframes[real_name] = pd.DataFrame()
 
+        # LLM pass
         llm_agent = LLMAgent()
         llm_edges = llm_agent.generate_kg(metadata_map).get("edges", [])
 
@@ -476,8 +526,8 @@ class KnowledgeGraphService:
         def label_fn(real_name: str) -> str:
             return real_name
 
-        # Note: Folder mode doesn't save to DB (no dataset IDs available)
-        # For folder mode, we'd need to create a dummy db session or skip DB saving
+        # Folder mode: create a temporary DB session for saving edges
+        # Note: dataset_map is empty, so edges won't be linked to specific datasets
         from app.database import SessionLocal
         db = SessionLocal()
         try:
@@ -496,9 +546,11 @@ class KnowledgeGraphService:
         finally:
             db.close()
 
+        # Deduplicate and limit edges
         edges = self._dedup_edges(edges)
         edges = self._limit_edges_per_column(edges, max_edges=3)
 
+        # Apply layout
         nodes = list(nodes_dict.values())
         final_nodes, edges = self._apply_layout(nodes, edges, is_folder=True)
 

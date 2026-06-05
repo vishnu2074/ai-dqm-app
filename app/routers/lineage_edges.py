@@ -1,8 +1,7 @@
 """
 app/routers/lineage_edges.py
-────────────────────────────
 CRUD endpoints for user-defined dataset → dataset lineage connections.
-FIXED: Validation now allows edges even if graph is empty or node IDs don't match exactly.
+FIXED: Made validation lenient - allows edges even if graph is empty
 """
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -10,7 +9,6 @@ from sqlalchemy.orm import Session
 from app.database import SessionLocal
 
 def get_db():
-    """Database session dependency"""
     db = SessionLocal()
     try:
         yield db
@@ -32,10 +30,8 @@ class EdgePayload(BaseModel):
 
 @router.get("")
 def get_edges(db: Session = Depends(get_db)):
-    """Returns all nodes + all user-defined edges."""
     full_graph = LineageEngine.get_full_graph()
     db_edges = db.query(LineageEdge).all()
-    
     return {
         "nodes": full_graph["nodes"],
         "edges": [
@@ -46,7 +42,7 @@ def get_edges(db: Session = Depends(get_db)):
 
 @router.post("")
 def add_edge(payload: EdgePayload, db: Session = Depends(get_db)):
-    """Add a directed edge source → target. FIXED: More lenient validation."""
+    """Add a directed edge source → target. FIXED: Lenient validation."""
     if payload.source == payload.target:
         raise HTTPException(
             status_code=400,
@@ -62,7 +58,6 @@ def add_edge(payload: EdgePayload, db: Session = Depends(get_db)):
         node_ids = set()
 
     # FIXED: Only validate if we have nodes to validate against
-    # If graph is empty, allow the edge (it might be created before datasets are loaded)
     if node_ids:
         if payload.source not in node_ids:
             raise HTTPException(
@@ -85,8 +80,6 @@ def add_edge(payload: EdgePayload, db: Session = Depends(get_db)):
     edge = LineageEdge(source=payload.source, target=payload.target)
     db.add(edge)
     db.commit()
-    
-    print(f"[lineage] ✓ Saved edge: {payload.source} → {payload.target}")
 
     # Mirror to Delta
     try:
@@ -95,14 +88,12 @@ def add_edge(payload: EdgePayload, db: Session = Depends(get_db)):
     except Exception as _e:
         print(f"[delta_sync] lineage edge mirror failed (non-fatal): {_e}")
 
-    # Bust cache
     invalidate_cache()
 
     return {"status": "created", "source": payload.source, "target": payload.target}
 
 @router.delete("")
 def delete_edge(payload: EdgePayload, db: Session = Depends(get_db)):
-    """Remove a directed edge source → target."""
     edge = db.query(LineageEdge).filter_by(
         source=payload.source, target=payload.target
     ).first()
@@ -111,10 +102,7 @@ def delete_edge(payload: EdgePayload, db: Session = Depends(get_db)):
 
     db.delete(edge)
     db.commit()
-    
-    print(f"[lineage] ✓ Deleted edge: {payload.source} → {payload.target}")
 
-    # Mirror to Delta
     try:
         from app.delta_sync import delete_lineage_edge
         delete_lineage_edge(payload.source, payload.target)

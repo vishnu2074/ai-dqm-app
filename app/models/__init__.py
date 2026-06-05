@@ -325,3 +325,19 @@ class GovernanceAuditLog(Base):
     dataset_id = Column(Integer, nullable=True)
     resource_type = Column(String, nullable=True)
     resource_id = Column(String, nullable=True)
+
+
+    # Add this at the END of your existing app/models/__init__.py file
+
+class GovernanceAuditLog(Base):
+    """Audit trail for governance actions."""
+    __tablename__ = "governance_audit_log"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    action = Column(String, nullable=False, index=True)
+    user_id = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    details = Column(Text, nullable=True)
+    dataset_id = Column(Integer, nullable=True)
+    resource_type = Column(String, nullable=True)
+    resource_id = Column(String, nullable=True)
