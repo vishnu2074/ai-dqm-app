@@ -1,22 +1,18 @@
 """
 python-backend/app/database.py
-Hybrid database layer with VALIDATION and AUTO-RECOVERY.
+Hybrid database layer with BACKUP and VALIDATION.
 
 PRIMARY:   SQLAlchemy ORM → SQLite at /tmp/ai-dqm/ai_dqm.db
 PERSISTENCE: Azure Blob Storage (container: intern26, blob: ai-dqm/ai_dqm.db)
-  - On startup: download from blob
+  - On startup: download from blob (with backup)
   - Periodic: upload every 5 minutes
   - On write: upload after profiling runs
 
-v2.0 CHANGES:
-  - Added DB validation after download (checks if valid SQLite)
-  - Auto-recreates DB if downloaded file is invalid/empty
-  - Fixes file permissions after download
-  - Explicit table creation with error handling
-  - Added GovernanceSystemConfig table
+FIXED: Now creates backup before overwriting, prevents data loss on redeploy
 """
 from __future__ import annotations
 import os
+import shutil
 import stat
 import threading
 import time
@@ -28,6 +24,7 @@ from sqlalchemy.orm import sessionmaker
 # ── Paths ─────────────────────────────────────────────────────────────────────
 _DB_DIR  = Path("/tmp/ai-dqm")
 _DB_PATH = _DB_DIR / "ai_dqm.db"
+_BACKUP_PATH = _DB_DIR / "ai_dqm.db.backup"
 _DB_DIR.mkdir(parents=True, exist_ok=True)
 
 _AGENT_DB_PATH = _DB_DIR / "agent_history.db"
@@ -78,6 +75,16 @@ def _validate_sqlite_db(db_path: Path) -> bool:
         # Try to read the schema
         result = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         conn.close()
+        
+        # Check if critical tables exist
+        table_names = {row[0] for row in result}
+        critical_tables = {'data_sources', 'datasets', 'profiling_runs', 'column_profiles'}
+        missing = critical_tables - table_names
+        
+        if missing:
+            print(f"[database] DB validation failed — missing critical tables: {missing}")
+            return False
+            
         print(f"[database] ✓ DB validation passed — {len(result)} tables found, {file_size:,} bytes")
         return True
     except Exception as e:
@@ -105,46 +112,103 @@ def _fix_db_permissions(db_path: Path):
         print(f"[database] Warning: Could not fix permissions: {e}")
 
 
+def _count_tables(db_path: Path) -> int:
+    """Count tables in a SQLite database."""
+    try:
+        import sqlite3
+        conn = sqlite3.connect(str(db_path))
+        result = conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table'").fetchone()
+        conn.close()
+        return result[0] if result else 0
+    except:
+        return 0
+
+
+def _count_records(db_path: Path) -> int:
+    """Count total records across all tables."""
+    try:
+        import sqlite3
+        conn = sqlite3.connect(str(db_path))
+        tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        total = 0
+        for table in tables:
+            try:
+                count = conn.execute(f"SELECT COUNT(*) FROM {table[0]}").fetchone()[0]
+                total += count
+            except:
+                pass
+        conn.close()
+        return total
+    except:
+        return 0
+
+
 def download_db_from_blob() -> bool:
     """
     Download ai_dqm.db from Azure Blob on startup.
-    Validates the downloaded file. If invalid, deletes it and returns False
-    so a fresh DB will be created.
+    FIXED: Creates backup before overwriting, compares data before replacing.
     Returns True on success.
     """
     client = _blob_client()
     if client is None:
-        print("[database] No Azure Blob config — starting with fresh local DB")
+        print("[database] No Azure Blob config — using local DB only")
         return False
     
+    # Download to a temp file first
+    temp_path = _DB_PATH.with_suffix(".db.tmp")
     try:
-        # Download to a temp file first
-        temp_path = _DB_PATH.with_suffix(".db.tmp")
         with open(temp_path, "wb") as f:
             client.download_blob().readinto(f)
         
         # Validate the downloaded file
-        if _validate_sqlite_db(temp_path):
-            # Valid — replace the main DB
-            if _DB_PATH.exists():
-                _DB_PATH.unlink()  # Delete old file
-            temp_path.rename(_DB_PATH)
-            _fix_db_permissions(_DB_PATH)
-            size_kb = _DB_PATH.stat().st_size // 1024
-            print(f"[database] ✓ Restored ai_dqm.db from Azure Blob ({size_kb} KB) — all data intact")
-            return True
-        else:
-            # Invalid — delete temp file and start fresh
+        if not _validate_sqlite_db(temp_path):
             if temp_path.exists():
                 temp_path.unlink()
-            print("[database] Downloaded DB is invalid — will create fresh DB")
+            print("[database] Downloaded DB is invalid — keeping local DB")
             return False
+        
+        # FIXED: Compare with local DB before overwriting
+        if _DB_PATH.exists():
+            local_size = _DB_PATH.stat().st_size
+            local_tables = _count_tables(_DB_PATH)
+            local_records = _count_records(_DB_PATH)
             
+            blob_size = temp_path.stat().st_size
+            blob_tables = _count_tables(temp_path)
+            blob_records = _count_records(temp_path)
+            
+            print(f"[database] Local DB: {local_size:,} bytes, {local_tables} tables, {local_records} records")
+            print(f"[database] Blob DB:  {blob_size:,} bytes, {blob_tables} tables, {blob_records} records")
+            
+            # If local DB has more data, keep it (don't overwrite with older blob version)
+            if local_records > blob_records:
+                print(f"[database] ⚠ Local DB has more data ({local_records} vs {blob_records} records) — keeping local DB")
+                if temp_path.exists():
+                    temp_path.unlink()
+                return False
+        
+        # FIXED: Create backup before overwriting
+        if _DB_PATH.exists():
+            try:
+                shutil.copy2(_DB_PATH, _BACKUP_PATH)
+                print(f"[database] ✓ Created backup at {_BACKUP_PATH}")
+            except Exception as e:
+                print(f"[database] Warning: Could not create backup: {e}")
+        
+        # Replace the main DB
+        if _DB_PATH.exists():
+            _DB_PATH.unlink()
+        temp_path.rename(_DB_PATH)
+        _fix_db_permissions(_DB_PATH)
+        
+        size_kb = _DB_PATH.stat().st_size // 1024
+        print(f"[database] ✓ Restored ai_dqm.db from Azure Blob ({size_kb} KB)")
+        return True
+        
     except Exception as e:
         # ResourceNotFoundError on first deploy — start fresh
         print(f"[database] No existing DB blob ({type(e).__name__}) — starting with fresh DB")
         # Clean up any partial downloads
-        temp_path = _DB_PATH.with_suffix(".db.tmp")
         if temp_path.exists():
             temp_path.unlink()
         return False
@@ -168,7 +232,8 @@ def upload_db_to_blob() -> bool:
         with open(_DB_PATH, "rb") as f:
             client.upload_blob(f, overwrite=True)
         size_kb = _DB_PATH.stat().st_size // 1024
-        print(f"[database] ✓ Backed up ai_dqm.db to Azure Blob ({size_kb} KB)")
+        records = _count_records(_DB_PATH)
+        print(f"[database] ✓ Backed up ai_dqm.db to Azure Blob ({size_kb} KB, {records} records)")
         return True
     except Exception as e:
         print(f"[database] Blob upload failed: {e}")

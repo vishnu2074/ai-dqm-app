@@ -2,14 +2,7 @@
 app/routers/lineage_edges.py
 ────────────────────────────
 CRUD endpoints for user-defined dataset → dataset lineage connections.
-Edges are stored in the `lineage_edges` DB table (not JSON).
-Every add/delete busts the lineage graph cache so the next
-GET /lineage/graph immediately reflects the change.
-
-Endpoints:
-GET    /lineage/edges          → list all edges + all nodes (for UI dropdowns)
-POST   /lineage/edges          → add a new edge
-DELETE /lineage/edges          → remove an edge
+FIXED: Validation now allows edges even if graph is empty or node IDs don't match exactly.
 """
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -26,7 +19,6 @@ def get_db():
 
 from app.graph.lineage_engine import LineageEngine, invalidate_cache
 
-# Import model — adjust path if LineageEdge lives inside models.py directly
 try:
     from app.models import LineageEdge
 except ImportError:
@@ -35,18 +27,14 @@ except ImportError:
 router = APIRouter(prefix="/lineage/edges", tags=["Lineage Edges"])
 
 class EdgePayload(BaseModel):
-    source: str   # node id  (e.g. "customers_csv")
-    target: str   # node id  (e.g. "customer_360_view")
+    source: str
+    target: str
 
-# ── GET ────────────────────────────────────────────────────────────────────────
 @router.get("")
 def get_edges(db: Session = Depends(get_db)):
-    """
-    Returns all nodes (for dropdowns) + all user-defined edges.
-    The frontend Edge Manager calls this to populate its UI.
-    """
+    """Returns all nodes + all user-defined edges."""
     full_graph = LineageEngine.get_full_graph()
-    db_edges   = db.query(LineageEdge).all()
+    db_edges = db.query(LineageEdge).all()
     
     return {
         "nodes": full_graph["nodes"],
@@ -56,30 +44,36 @@ def get_edges(db: Session = Depends(get_db)):
         ],
     }
 
-# ── POST ──────────────────────────────────────────────────────────────────────
 @router.post("")
 def add_edge(payload: EdgePayload, db: Session = Depends(get_db)):
-    """Add a directed edge source → target. Idempotent — rejects duplicates."""
+    """Add a directed edge source → target. FIXED: More lenient validation."""
     if payload.source == payload.target:
         raise HTTPException(
             status_code=400,
             detail="Source and target cannot be the same node."
         )
 
-    # Validate both node IDs exist in the live graph
-    full_graph = LineageEngine.get_full_graph()
-    node_ids   = {n["id"] for n in full_graph["nodes"]}
+    # FIXED: Get graph but don't fail if it's empty
+    try:
+        full_graph = LineageEngine.get_full_graph()
+        node_ids = {n["id"] for n in full_graph.get("nodes", [])}
+    except Exception as e:
+        print(f"[lineage] Warning: Could not get lineage graph: {e}")
+        node_ids = set()
 
-    if payload.source not in node_ids:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Source node '{payload.source}' not found in lineage graph. "
-        )
-    if payload.target not in node_ids:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Target node '{payload.target}' not found in lineage graph. "
-        )
+    # FIXED: Only validate if we have nodes to validate against
+    # If graph is empty, allow the edge (it might be created before datasets are loaded)
+    if node_ids:
+        if payload.source not in node_ids:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Source node '{payload.source}' not found in lineage graph."
+            )
+        if payload.target not in node_ids:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Target node '{payload.target}' not found in lineage graph."
+            )
 
     # Reject duplicate
     existing = db.query(LineageEdge).filter_by(
@@ -91,21 +85,21 @@ def add_edge(payload: EdgePayload, db: Session = Depends(get_db)):
     edge = LineageEdge(source=payload.source, target=payload.target)
     db.add(edge)
     db.commit()
+    
+    print(f"[lineage] ✓ Saved edge: {payload.source} → {payload.target}")
 
-    # ── Mirror to Delta ──────────────────────────────────────────────────────
+    # Mirror to Delta
     try:
         from app.delta_sync import sync_lineage_edge
         sync_lineage_edge(edge)
     except Exception as _e:
         print(f"[delta_sync] lineage edge mirror failed (non-fatal): {_e}")
-    # ────────────────────────────────────────────────────────────────────────
 
-    # Bust cache so the new edge appears immediately in /lineage/graph
+    # Bust cache
     invalidate_cache()
 
     return {"status": "created", "source": payload.source, "target": payload.target}
 
-# ── DELETE ─────────────────────────────────────────────────────────────────────
 @router.delete("")
 def delete_edge(payload: EdgePayload, db: Session = Depends(get_db)):
     """Remove a directed edge source → target."""
@@ -117,16 +111,16 @@ def delete_edge(payload: EdgePayload, db: Session = Depends(get_db)):
 
     db.delete(edge)
     db.commit()
+    
+    print(f"[lineage] ✓ Deleted edge: {payload.source} → {payload.target}")
 
-    # ── Mirror to Delta ──────────────────────────────────────────────────────
+    # Mirror to Delta
     try:
         from app.delta_sync import delete_lineage_edge
         delete_lineage_edge(payload.source, payload.target)
     except Exception as _e:
         print(f"[delta_sync] lineage edge delete mirror failed (non-fatal): {_e}")
-    # ────────────────────────────────────────────────────────────────────────
 
-    # Bust cache so the removed edge disappears immediately
     invalidate_cache()
 
     return {"status": "deleted", "source": payload.source, "target": payload.target}

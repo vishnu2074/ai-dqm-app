@@ -278,6 +278,7 @@ try:
     except Exception as e:
         _STARTUP_ERRORS.append(f"periodic_backup: {e}")
 
+
     # ── Extract real DB path ─────────────────────────────────────────────────
     try:
         _db_url = str(engine.url)
@@ -303,6 +304,31 @@ except Exception as e:
     os.environ.setdefault("DB_PATH", "/tmp/ai-dqm/ai_dqm.db")
 
 
+# Add this AFTER the existing table creation code in _bootstrap_sqlite_schema():
+
+# ── governance_audit_log table ───────────────────────────────────────────
+gal_exists = conn.execute(
+    text("SELECT name FROM sqlite_master WHERE type='table' AND name='governance_audit_log'")
+).fetchone()
+if not gal_exists:
+    try:
+        conn.exec_driver_sql("""
+            CREATE TABLE governance_audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action TEXT NOT NULL,
+                user_id TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                details TEXT,
+                dataset_id INTEGER,
+                resource_type TEXT,
+                resource_id TEXT
+            )
+        """)
+        print("[bootstrap] ✓ Created governance_audit_log table")
+    except Exception as gal_err:
+        _STARTUP_ERRORS.append(f"governance_audit_log: {gal_err}")
+
+        
 # ── LLM client factory ─────────────────────────────────────────────────────
 _llm_client_instance = None
 
