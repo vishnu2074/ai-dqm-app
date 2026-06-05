@@ -1,8 +1,14 @@
+"""
+app/models/__init__.py
+All SQLAlchemy ORM models for AI DQM.
+CLEAN VERSION — no duplicate definitions.
+"""
 from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text, Float, Boolean, JSON
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from app.database import Base
+
 
 class DataSource(Base):
     __tablename__ = "data_sources"
@@ -22,6 +28,7 @@ class DataSource(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
+
 class Dataset(Base):
     __tablename__ = "datasets"
     id = Column(Integer, primary_key=True, index=True)
@@ -38,6 +45,7 @@ class Dataset(Base):
     versions = relationship("DatasetVersion", back_populates="dataset", cascade="all, delete-orphan", passive_deletes=True)
     dq_rule_runs = relationship("DQRuleRun", back_populates="dataset", cascade="all, delete-orphan", passive_deletes=True)
 
+
 class GlobalContext(Base):
     __tablename__ = "global_context"
     id = Column(Integer, primary_key=True, index=True)
@@ -45,6 +53,7 @@ class GlobalContext(Base):
     active_datasource_id = Column(Integer, ForeignKey("data_sources.id", ondelete="SET NULL"), nullable=True)
     active_dataset_id = Column(Integer, ForeignKey("datasets.id", ondelete="SET NULL"), nullable=True)
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
 
 class ProfilingRun(Base):
     __tablename__ = "profiling_runs"
@@ -58,12 +67,12 @@ class ProfilingRun(Base):
     status = Column(String, default="COMPLETED")
     error_message = Column(Text, nullable=True)
     is_full_scan = Column(Boolean, default=False)
-    
-    # ADDED: Timing columns
+
+    # Timing columns (populated by main.py migration)
     started_at = Column(String, nullable=True)
     completed_at = Column(String, nullable=True)
-    
-    # ADDED: AI-generated dataset description
+
+    # AI-generated dataset description
     ai_summary = Column(Text, nullable=True)
 
     dataset = relationship("Dataset", back_populates="profiling_runs")
@@ -73,6 +82,7 @@ class ProfilingRun(Base):
     compared_drift_records = relationship("DriftRecord", foreign_keys="DriftRecord.comparison_run_id", back_populates="comparison_run", cascade="all, delete-orphan", passive_deletes=True)
     schema_history_entries = relationship("SchemaHistory", back_populates="profiling_run", cascade="all, delete-orphan", passive_deletes=True)
     profiling_baselines = relationship("ProfilingBaseline", back_populates="profiling_run", cascade="all, delete-orphan", passive_deletes=True)
+
 
 class ColumnProfile(Base):
     __tablename__ = "column_profiles"
@@ -98,11 +108,12 @@ class ColumnProfile(Base):
     status = Column(String)
     health_score = Column(Float)
 
-    # ADDED: AI description and sensitivity classification
+    # AI description and sensitivity classification
     ai_description = Column(Text, nullable=True)
     sensitivity_label = Column(String, nullable=True, default="Public")
 
     profiling_run = relationship("ProfilingRun", back_populates="column_profiles")
+
 
 class ProfilingBaseline(Base):
     __tablename__ = "profiling_baselines"
@@ -117,6 +128,7 @@ class ProfilingBaseline(Base):
 
     dataset = relationship("Dataset", back_populates="profiling_baselines")
     profiling_run = relationship("ProfilingRun", back_populates="profiling_baselines")
+
 
 class QualityCheck(Base):
     __tablename__ = "temporal_checks"
@@ -134,7 +146,9 @@ class QualityCheck(Base):
 
     profiling_run = relationship("ProfilingRun", back_populates="quality_checks")
 
+
 TemporalCheck = QualityCheck
+
 
 class DriftRecord(Base):
     __tablename__ = "drift_records"
@@ -144,12 +158,13 @@ class DriftRecord(Base):
     drift_score = Column(Float)
     drift_type = Column(String)
     comparison_run_id = Column(Integer, ForeignKey("profiling_runs.id", ondelete="CASCADE"), nullable=True)
-    
-    # ADDED: Timestamp for trend analysis
+
+    # Timestamp for trend analysis
     created_at = Column(String, nullable=True)
 
     profiling_run = relationship("ProfilingRun", foreign_keys=[profiling_run_id], back_populates="drift_records")
     comparison_run = relationship("ProfilingRun", foreign_keys=[comparison_run_id], back_populates="compared_drift_records")
+
 
 class SchemaHistory(Base):
     __tablename__ = "schema_history"
@@ -165,6 +180,7 @@ class SchemaHistory(Base):
 
     dataset = relationship("Dataset", back_populates="schema_history_entries")
     profiling_run = relationship("ProfilingRun", back_populates="schema_history_entries")
+
 
 class DQRule(Base):
     __tablename__ = "dq_rules"
@@ -186,6 +202,7 @@ class DQRule(Base):
 
     dataset = relationship("Dataset", back_populates="dq_rules")
 
+
 class DQRuleChangeLog(Base):
     __tablename__ = "dq_rule_history"
     id = Column(Integer, primary_key=True, index=True)
@@ -200,6 +217,7 @@ class DQRuleChangeLog(Base):
 
     dataset = relationship("Dataset", back_populates="dq_rule_change_logs")
 
+
 class DatasetVersion(Base):
     __tablename__ = "dataset_versions"
     id = Column(Integer, primary_key=True, index=True)
@@ -213,6 +231,7 @@ class DatasetVersion(Base):
 
     dataset = relationship("Dataset", back_populates="versions")
     parent = relationship("DatasetVersion", remote_side=[id])
+
 
 class DQRuleRun(Base):
     __tablename__ = "dq_rule_runs"
@@ -231,6 +250,7 @@ class DQRuleRun(Base):
     output_version = relationship("DatasetVersion", foreign_keys=[output_version_id])
     results = relationship("DQRuleRunResult", back_populates="run", cascade="all, delete-orphan", passive_deletes=True)
 
+
 class DQRuleRunResult(Base):
     __tablename__ = "dq_rule_run_results"
     id = Column(Integer, primary_key=True, index=True)
@@ -247,6 +267,7 @@ class DQRuleRunResult(Base):
 
     run = relationship("DQRuleRun", back_populates="results")
 
+
 class LineageEdge(Base):
     """User-defined dataset to dataset lineage connections."""
     __tablename__ = "lineage_edges"
@@ -254,6 +275,7 @@ class LineageEdge(Base):
     source = Column(String, nullable=False, index=True)
     target = Column(String, nullable=False, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
 
 class KnowledgeGraphEdge(Base):
     __tablename__ = "knowledge_graph_edges"
@@ -274,6 +296,7 @@ class KnowledgeGraphEdge(Base):
     detected_at = Column(DateTime(timezone=True), server_default=func.now())
     invalidated = Column(Boolean, default=False)
 
+
 class NotificationInbox(Base):
     """Unified notification inbox for all system events."""
     __tablename__ = "notification_inbox"
@@ -284,7 +307,7 @@ class NotificationInbox(Base):
     type = Column(String, default="ALERT", nullable=False)
     category = Column(String, default="System")
     severity = Column(String, default="info")
-    
+
     # NOTE: The actual DB table has 'dataset' TEXT column
     dataset_id = Column(Integer, ForeignKey("datasets.id", ondelete="SET NULL"), nullable=True)
     dataset = Column(String, nullable=True)  # Actual column in DB
@@ -297,6 +320,7 @@ class NotificationInbox(Base):
 
     ds = relationship("Dataset")
 
+
 class NotificationPreference(Base):
     __tablename__ = "notification_preferences"
     id = Column(Integer, primary_key=True, index=True)
@@ -304,6 +328,7 @@ class NotificationPreference(Base):
     event_type = Column(String)
     enabled = Column(Boolean, default=True)
     channel = Column(String, default="in_app")
+
 
 class GovernanceNotification(Base):
     __tablename__ = "governance_notifications"
@@ -313,26 +338,10 @@ class GovernanceNotification(Base):
     enabled = Column(Boolean, default=True)
     channel = Column(String, default="in_app")
 
-# ADDED: Governance Audit Log model
-class GovernanceAuditLog(Base):
-    """Audit trail for governance actions."""
-    __tablename__ = "governance_audit_log"
-    id = Column(Integer, primary_key=True, index=True)
-    action = Column(String, nullable=False, index=True)
-    user_id = Column(String, nullable=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    details = Column(Text, nullable=True)
-    dataset_id = Column(Integer, nullable=True)
-    resource_type = Column(String, nullable=True)
-    resource_id = Column(String, nullable=True)
-
-
-    # Add this at the END of your existing app/models/__init__.py file
 
 class GovernanceAuditLog(Base):
     """Audit trail for governance actions."""
     __tablename__ = "governance_audit_log"
-    
     id = Column(Integer, primary_key=True, index=True)
     action = Column(String, nullable=False, index=True)
     user_id = Column(String, nullable=True)
