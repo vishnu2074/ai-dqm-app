@@ -24,6 +24,7 @@ def get_db():
 
 class GovernancePolicy(Base):
     __tablename__ = "governance_policies"
+    __table_args__ = {'extend_existing': True}
     id             = Column(String, primary_key=True)
     name           = Column(String, nullable=False)
     description    = Column(Text, default="")
@@ -36,6 +37,7 @@ class GovernancePolicy(Base):
 
 class GovernanceUser(Base):
     __tablename__ = "governance_users"
+    __table_args__ = {'extend_existing': True}
     id              = Column(String, primary_key=True)
     name            = Column(String, nullable=False)
     email           = Column(String, unique=True, nullable=False, index=True)
@@ -48,11 +50,13 @@ class GovernanceUser(Base):
 
 class GovernanceSystemConfig(Base):
     __tablename__ = "governance_system_config"
+    __table_args__ = {'extend_existing': True}
     key   = Column(String, primary_key=True)
     value = Column(Text)
 
 class GovernanceAuditLog(Base):
     __tablename__ = "governance_audit_log"
+    __table_args__ = {'extend_existing': True}
     id             = Column(String, primary_key=True)
     timestamp      = Column(String, nullable=False)
     user           = Column(String, default="System")
@@ -65,9 +69,14 @@ class GovernanceAuditLog(Base):
 
 class GovernanceDismissedSuggestion(Base):
     __tablename__ = "governance_dismissed_suggestions"
+    __table_args__ = {'extend_existing': True}
     id = Column(String, primary_key=True)
 
-Base.metadata.create_all(bind=engine)
+# NOTE: create_all handled by main.py — using checkfirst=True here to avoid conflicts
+try:
+    Base.metadata.create_all(bind=engine, checkfirst=True)
+except Exception:
+    pass
 
 # ── Safe migrations ────────────────────────────────────────────────────────────
 for _migration_sql in [

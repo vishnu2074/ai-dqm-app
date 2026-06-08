@@ -290,6 +290,27 @@ _CATEGORY_TO_NOTIF_ID: dict = {
 }
 
 
+def _ensure_governance_notifications_columns() -> None:
+    """Add missing columns to governance_notifications if they don't exist yet."""
+    try:
+        from app.database import engine
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            for col_def in [
+                "ALTER TABLE governance_notifications ADD COLUMN recipient_email TEXT DEFAULT ''",
+                "ALTER TABLE governance_notifications ADD COLUMN slack_webhook TEXT DEFAULT ''",
+            ]:
+                try:
+                    conn.execute(text(col_def))
+                    conn.commit()
+                except Exception:
+                    pass  # Column already exists — safe to ignore
+    except Exception as e:
+        logger.debug("[notif] governance_notifications column migration: %s", e)
+
+_ensure_governance_notifications_columns()
+
+
 def _get_channel_pref_from_db(category: str) -> dict:
     default = {"channel": "in_app", "enabled": True, "recipient_email": "", "slack_webhook": ""}
     try:
@@ -299,12 +320,21 @@ def _get_channel_pref_from_db(category: str) -> dict:
         if not notif_id:
             return default
         with SessionLocal() as db:
+            # Level 1: Full query with all optional columns
             try:
                 row = db.execute(text(
                     "SELECT enabled, channel, recipient_email, slack_webhook "
                     "FROM governance_notifications WHERE id = :id"
                 ), {"id": notif_id}).fetchone()
+                if row:
+                    return {"enabled": bool(row[0]), "channel": row[1] or "in_app",
+                            "recipient_email": row[2] or "", "slack_webhook": row[3] or ""}
+                return default
             except Exception:
+                pass
+
+            # Level 2: Without slack_webhook
+            try:
                 row = db.execute(text(
                     "SELECT enabled, channel, recipient_email "
                     "FROM governance_notifications WHERE id = :id"
@@ -312,10 +342,23 @@ def _get_channel_pref_from_db(category: str) -> dict:
                 if row:
                     return {"enabled": bool(row[0]), "channel": row[1] or "in_app",
                             "recipient_email": row[2] or "", "slack_webhook": ""}
-            if not row:
                 return default
-            return {"enabled": bool(row[0]), "channel": row[1] or "in_app",
-                    "recipient_email": row[2] or "", "slack_webhook": row[3] or ""}
+            except Exception:
+                pass
+
+            # Level 3: Minimal — just enabled + channel (always safe)
+            try:
+                row = db.execute(text(
+                    "SELECT enabled, channel "
+                    "FROM governance_notifications WHERE id = :id"
+                ), {"id": notif_id}).fetchone()
+                if row:
+                    return {"enabled": bool(row[0]), "channel": row[1] or "in_app",
+                            "recipient_email": "", "slack_webhook": ""}
+            except Exception:
+                pass
+
+        return default
     except Exception as e:
         logger.warning("[notif] Could not read channel pref for '%s': %s", category, e)
         return default

@@ -216,6 +216,151 @@ try:
                     except Exception as gsc_err:
                         _STARTUP_ERRORS.append(f"governance_system_config: {gsc_err}")
 
+                # ── governance_notifications columns (recipient_email, slack_webhook) ─
+                gn_exists = conn.execute(
+                    text("SELECT name FROM sqlite_master WHERE type='table' AND name='governance_notifications'")
+                ).fetchone()
+                if gn_exists:
+                    gn_cols = conn.execute(text("PRAGMA table_info(governance_notifications)")).fetchall()
+                    gn_existing = {row[1] for row in gn_cols}
+                    for col, defn in [
+                        ("recipient_email", "TEXT DEFAULT ''"),
+                        ("slack_webhook",   "TEXT DEFAULT ''"),
+                    ]:
+                        if col not in gn_existing:
+                            try:
+                                conn.exec_driver_sql(f"ALTER TABLE governance_notifications ADD COLUMN {col} {defn}")
+                                print(f"[bootstrap] Added column governance_notifications.{col}")
+                            except Exception:
+                                pass  # Already exists
+
+
+                # ── column_profiles.null_percentage ──────────────────────────────────
+                # Re-open cp block to add null_percentage (needed by policy_suggestions)
+                if cp_exists:
+                    cp_cols2 = conn.execute(text("PRAGMA table_info(column_profiles)")).fetchall()
+                    cp_existing2 = {row[1] for row in cp_cols2}
+                    for col, defn in [
+                        ("null_percentage",   "REAL DEFAULT 0.0"),
+                        ("null_count",        "INTEGER DEFAULT 0"),
+                        ("distinct_count",    "INTEGER DEFAULT 0"),
+                        ("health_score",      "REAL DEFAULT 100.0"),
+                    ]:
+                        if col not in cp_existing2:
+                            try:
+                                conn.exec_driver_sql(f"ALTER TABLE column_profiles ADD COLUMN {col} {defn}")
+                                print(f"[bootstrap] Added column column_profiles.{col}")
+                            except Exception:
+                                pass
+
+                # ── temporal_checks.created_at ────────────────────────────────────────
+                tc_exists = conn.execute(
+                    text("SELECT name FROM sqlite_master WHERE type='table' AND name='temporal_checks'")
+                ).fetchone()
+                if tc_exists:
+                    tc_cols = conn.execute(text("PRAGMA table_info(temporal_checks)")).fetchall()
+                    tc_existing = {row[1] for row in tc_cols}
+                    if "created_at" not in tc_existing:
+                        try:
+                            conn.exec_driver_sql("ALTER TABLE temporal_checks ADD COLUMN created_at TEXT")
+                            conn.exec_driver_sql("""
+                                UPDATE temporal_checks
+                                SET created_at = (
+                                    SELECT strftime('%Y-%m-%d %H:%M:%S', pr.timestamp)
+                                    FROM profiling_runs pr
+                                    WHERE pr.id = temporal_checks.profiling_run_id
+                                )
+                                WHERE created_at IS NULL AND profiling_run_id IS NOT NULL
+                            """)
+                            conn.commit()
+                            print("[bootstrap] Added column temporal_checks.created_at + backfilled")
+                        except Exception as tc_err:
+                            _STARTUP_ERRORS.append(f"tc_created_at: {tc_err}")
+                            print(f"[bootstrap] ✗ temporal_checks.created_at: {tc_err}")
+
+                # ── governance_policies.source ────────────────────────────────────────
+                gp_exists = conn.execute(
+                    text("SELECT name FROM sqlite_master WHERE type='table' AND name='governance_policies'")
+                ).fetchone()
+                if gp_exists:
+                    gp_cols = conn.execute(text("PRAGMA table_info(governance_policies)")).fetchall()
+                    gp_existing = {row[1] for row in gp_cols}
+                    if "source" not in gp_existing:
+                        try:
+                            conn.exec_driver_sql(
+                                "ALTER TABLE governance_policies ADD COLUMN source TEXT DEFAULT 'manual'"
+                            )
+                            print("[bootstrap] Added column governance_policies.source")
+                        except Exception:
+                            pass
+
+                # ── dq_rule_runs table ────────────────────────────────────────────────
+                dqrr_exists = conn.execute(
+                    text("SELECT name FROM sqlite_master WHERE type='table' AND name='dq_rule_runs'")
+                ).fetchone()
+                if not dqrr_exists:
+                    try:
+                        conn.exec_driver_sql("""
+                            CREATE TABLE dq_rule_runs (
+                                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                                rule_id      INTEGER NOT NULL,
+                                dataset_id   INTEGER,
+                                status       TEXT DEFAULT 'completed',
+                                executed_at  TEXT DEFAULT CURRENT_TIMESTAMP,
+                                passed_count INTEGER DEFAULT 0,
+                                failed_count INTEGER DEFAULT 0,
+                                total_count  INTEGER DEFAULT 0
+                            )
+                        """)
+                        print("[bootstrap] ✓ Created dq_rule_runs table")
+                    except Exception as e:
+                        _STARTUP_ERRORS.append(f"dq_rule_runs: {e}")
+
+                # ── dq_rule_run_results table ─────────────────────────────────────────
+                dqrrr_exists = conn.execute(
+                    text("SELECT name FROM sqlite_master WHERE type='table' AND name='dq_rule_run_results'")
+                ).fetchone()
+                if not dqrrr_exists:
+                    try:
+                        conn.exec_driver_sql("""
+                            CREATE TABLE dq_rule_run_results (
+                                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                                rule_id     INTEGER NOT NULL,
+                                dataset_id  INTEGER,
+                                run_id      INTEGER,
+                                result      TEXT DEFAULT 'passed',
+                                row_count   INTEGER DEFAULT 0,
+                                executed_at TEXT DEFAULT CURRENT_TIMESTAMP
+                            )
+                        """)
+                        print("[bootstrap] ✓ Created dq_rule_run_results table")
+                    except Exception as e:
+                        _STARTUP_ERRORS.append(f"dq_rule_run_results: {e}")
+
+                # ── knowledge_graph_edges — ensure health-metric columns exist ─────────
+                kge_exists = conn.execute(
+                    text("SELECT name FROM sqlite_master WHERE type='table' AND name='knowledge_graph_edges'")
+                ).fetchone()
+                if kge_exists:
+                    kge_cols = conn.execute(text("PRAGMA table_info(knowledge_graph_edges)")).fetchall()
+                    kge_existing = {row[1] for row in kge_cols}
+                    for col, defn in [
+                        ("confidence",        "REAL DEFAULT 0.8"),
+                        ("created_at",        "TEXT"),
+                        ("relationship_type", "TEXT"),
+                        ("source_node",       "TEXT"),
+                        ("target_node",       "TEXT"),
+                        ("folder",            "TEXT"),
+                    ]:
+                        if col not in kge_existing:
+                            try:
+                                conn.exec_driver_sql(
+                                    f"ALTER TABLE knowledge_graph_edges ADD COLUMN {col} {defn}"
+                                )
+                                print(f"[bootstrap] Added column knowledge_graph_edges.{col}")
+                            except Exception:
+                                pass
+
                 # ── governance_audit_log table ────────────────────────────────
                 gal_exists = conn.execute(
                     text("SELECT name FROM sqlite_master WHERE type='table' AND name='governance_audit_log'")

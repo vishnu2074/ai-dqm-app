@@ -652,6 +652,19 @@ def _tab_dq_scores(conn, s, dataset_id) -> dict:
         row_rc   = _one(conn, f"SELECT COUNT(*) FROM dq_rule_run_results WHERE 1=1 {ds_rr}", rr_p)
         passed   = 0
         rr_total = row_rc[0] if row_rc else 0
+    # ── Fallback: aggregate from dq_rule_runs if dq_rule_run_results is empty ──
+    if rr_total == 0 and _table_exists(conn, "dq_rule_runs"):
+        rr2_cols = _columns(conn, "dq_rule_runs")
+        if "passed_count" in rr2_cols and "total_count" in rr2_cols:
+            ds_rr2 = "AND dataset_id = ?" if (dataset_id and "dataset_id" in rr2_cols) else ""
+            rr2_p  = [dataset_id] if ds_rr2 else []
+            row_agg = _one(conn,
+                f"SELECT COALESCE(SUM(passed_count),0) as passed, COALESCE(SUM(total_count),0) as total "
+                f"FROM dq_rule_runs WHERE 1=1 {ds_rr2}", rr2_p)
+            if row_agg and row_agg["total"] > 0:
+                passed   = row_agg["passed"]
+                rr_total = row_agg["total"]
+
     rca_val    = safe_pct(passed, rr_total)
     rca_status = _status(rca_val, healthy_ge=90, critical_lt=60)
 
@@ -870,8 +883,7 @@ def _tab_monitoring_trends(conn, s, dataset_id) -> dict:
         "neutral"  if drift_total == 0
         else "healthy"  if significant > 0 and ddp_val >= 20
         else "warning"  if significant > 0
-        else "critical" if drift_total > 0
-        else "neutral"
+        else "neutral"  # 0 significant drift = neutral (expected in new/single-baseline systems)
     )
 
     # ── drift_volume_trend ────────────────────────────────────────────────────
