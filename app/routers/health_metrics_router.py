@@ -476,13 +476,14 @@ def _tab_global_ai_llm(conn, s, dataset_id) -> dict:
               {"no_summary": no_s, "completed": hal_den,
                "completed_status_used": pr_comp}),
 
-            M("avg_llm_latency_ms", "Avg LLM Latency",
+            M("avg_llm_latency_ms", "Avg Profiling Duration",
               dur["avg_ms"], "ms",
               "healthy" if dur["avg_ms"] == 0 else (
-                  "healthy" if dur["avg_ms"] < 3000 else "warning"),
+                  "healthy" if dur["avg_ms"] < 10_000 else (
+                  "warning" if dur["avg_ms"] < 30_000 else "critical")),
               "mean(completed_at - started_at) across completed profiling runs",
               {"samples": dur["samples"],
-               "note": "Will populate once profiling code writes started_at/completed_at"}),
+               "note": "Total profiling duration per run (includes data load + scoring + LLM summary)"}),
 
             M("response_relevance", "Response Relevance",
               rr_val, "%", rr_status,
@@ -1055,7 +1056,7 @@ def _tab_data_lineage(conn, s, dataset_id) -> dict:
     else:
         mapped, edges = 0, 0
     lc_val    = safe_pct(mapped, total_datasets)
-    lc_status = _status(lc_val, healthy_ge=80, critical_lt=1)
+    lc_status = "neutral" if edges == 0 else _status(lc_val, healthy_ge=80, critical_lt=20)
 
     # ── broken_edge_count ─────────────────────────────────────────────────────
     broken = 0
@@ -1218,7 +1219,7 @@ def _tab_dq_assistant(conn, s, dataset_id) -> dict:
 
     ara_status = _status(ara_val, healthy_ge=90, critical_lt=50)
     ncr_status = _status(ncr_val, healthy_ge=90, critical_lt=50)
-    rgs_status = _status(rgs_val, healthy_ge=70, critical_lt=20)
+    rgs_status = "neutral" if rgs_val == 0 else _status(rgs_val, healthy_ge=70, critical_lt=20)
 
     # ── governance_notifications ──────────────────────────────────────────────
     row_gn = _one(conn, "SELECT COUNT(*) FROM governance_notifications") \
@@ -1409,8 +1410,10 @@ def _tab_system_platform(conn, s, dataset_id) -> dict:
                 t0 = datetime.fromisoformat(rows_ts[0][0].replace("Z", "+00:00"))
                 t1 = datetime.fromisoformat(rows_ts[-1][0].replace("Z", "+00:00"))
                 elapsed_h = (t1 - t0).total_seconds() / 3600
-                if elapsed_h > 0:
-                    throughput = round(len(rows_ts) / elapsed_h, 3)
+                # Enforce 24h minimum window — prevents inflated throughput when all
+                # runs are clustered in a short burst (e.g. initial setup / bulk profiling)
+                elapsed_h = max(elapsed_h, 24.0)
+                throughput = round(len(rows_ts) / elapsed_h, 3)
             except Exception:
                 pass
     at_status = ("neutral"  if throughput == 0

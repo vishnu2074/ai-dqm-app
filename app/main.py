@@ -153,26 +153,39 @@ try:
                     dr_cols = conn.execute(text("PRAGMA table_info(drift_records)")).fetchall()
                     dr_existing = {row[1] for row in dr_cols}
 
+                    # Add column if missing
                     if "created_at" not in dr_existing:
                         try:
                             conn.exec_driver_sql("ALTER TABLE drift_records ADD COLUMN created_at TEXT")
                             print("[bootstrap] Added column drift_records.created_at")
+                        except Exception as dr_col_err:
+                            _STARTUP_ERRORS.append(f"drift_created_at_col: {dr_col_err}")
 
+                    # ALWAYS backfill NULLs on every startup — use raw pr.timestamp
+                    # strftime() on ISO+timezone strings returns NULL in SQLite
+                    try:
+                        null_dr = conn.execute(text(
+                            "SELECT COUNT(*) FROM drift_records "
+                            "WHERE created_at IS NULL AND profiling_run_id IS NOT NULL"
+                        )).fetchone()
+                        if null_dr and null_dr[0] > 0:
                             conn.exec_driver_sql("""
                                 UPDATE drift_records
                                 SET created_at = (
-                                    SELECT strftime('%Y-%m-%d %H:%M:%S', timestamp)
-                                    FROM profiling_runs
-                                    WHERE id = drift_records.profiling_run_id
+                                    SELECT pr.timestamp
+                                    FROM profiling_runs pr
+                                    WHERE pr.id = drift_records.profiling_run_id
                                 )
                                 WHERE created_at IS NULL AND profiling_run_id IS NOT NULL
                             """)
                             conn.commit()
-                            print("[bootstrap] ✓ drift_records.created_at backfill complete")
-                        except Exception as dr_err:
-                            _STARTUP_ERRORS.append(f"drift_created_at: {dr_err}")
-                            print(f"[bootstrap] ✗ drift_records.created_at failed: {dr_err}")
-
+                            filled = conn.execute(text(
+                                "SELECT COUNT(*) FROM drift_records WHERE created_at IS NOT NULL"
+                            )).fetchone()
+                            print(f"[bootstrap] ✓ drift_records.created_at: {filled[0] if filled else 0} rows filled")
+                    except Exception as dr_err:
+                        _STARTUP_ERRORS.append(f"drift_created_at: {dr_err}")
+                        print(f"[bootstrap] ✗ drift_records.created_at backfill: {dr_err}")
                 # ── notification_inbox columns ────────────────────────────────
                 ni_exists = conn.execute(
                     text("SELECT name FROM sqlite_master WHERE type='table' AND name='notification_inbox'")
