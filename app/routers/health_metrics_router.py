@@ -467,6 +467,56 @@ def _tab_global_ai_llm(conn, s, dataset_id) -> dict:
         f"Detected completed_status='{pr_comp}', ai_summary_col='{ai_col}'."
     )
 
+    # ── ai_column_description_rate ────────────────────────────────────────────
+    # % of individual column_profiles that have a non-empty ai_description.
+    # Measures depth of AI annotation — not just whether runs produced a summary,
+    # but whether each column was described by the LLM.
+    acd_val, acd_status = None, "neutral"
+    if cp_ai:
+        row_acd = _one(conn,
+            f"SELECT "
+            f"COUNT(CASE WHEN {cp_ai} IS NOT NULL AND TRIM({cp_ai}) != '' THEN 1 END) as has_ai, "
+            f"COUNT(*) as total FROM column_profiles WHERE 1=1 {ds_cp}", cp_p)
+        acd_has   = row_acd["has_ai"] if row_acd else 0
+        acd_total = row_acd["total"]  if row_acd else 0
+        acd_val   = safe_pct(acd_has, acd_total)
+        acd_status = _status(acd_val, healthy_ge=70, critical_lt=30)
+
+    # ── ai_insight_depth_score ────────────────────────────────────────────────
+    # Average character length of ai_summary across all completed profiling runs.
+    # A proxy for how substantive / detailed the LLM responses are.
+    # Healthy ≥ 200 chars (a real paragraph), warning 100-200, critical < 100.
+    aid_val, aid_status = None, "neutral"
+    if ai_col and pr_comp:
+        row_aid = _one(conn,
+            f"SELECT ROUND(AVG(LENGTH({ai_col}))) as avg_len FROM profiling_runs "
+            f"WHERE status = ? AND {ai_col} IS NOT NULL AND TRIM({ai_col}) != '' {ds_pr}",
+            [pr_comp] + pr_p)
+        if row_aid and row_aid["avg_len"]:
+            aid_val = int(row_aid["avg_len"])
+            aid_status = (
+                "healthy"  if aid_val >= 200 else
+                "warning"  if aid_val >= 100 else
+                "critical"
+            )
+
+    # ── llm_dataset_coverage ──────────────────────────────────────────────────
+    # % of registered datasets that have at least one completed run with a
+    # non-empty ai_summary. Tells you which datasets are "AI-analysed" vs
+    # only technically profiled (schema only, no LLM insight).
+    ldc_val, ldc_status = None, "neutral"
+    if ai_col and pr_comp:
+        row_ds_total = _one(conn, "SELECT COUNT(*) as n FROM datasets")
+        n_datasets = row_ds_total["n"] if row_ds_total else 0
+        if n_datasets > 0:
+            row_ldc = _one(conn,
+                f"SELECT COUNT(DISTINCT dataset_id) as covered FROM profiling_runs "
+                f"WHERE status = ? AND {ai_col} IS NOT NULL AND TRIM({ai_col}) != '' {ds_pr}",
+                [pr_comp] + pr_p)
+            ldc_covered = row_ldc["covered"] if row_ldc else 0
+            ldc_val    = safe_pct(ldc_covered, n_datasets)
+            ldc_status = _status(ldc_val, healthy_ge=80, critical_lt=40)
+
     return {
         "tab": "Global AI / LLM",
         "metrics": [
@@ -495,6 +545,26 @@ def _tab_global_ai_llm(conn, s, dataset_id) -> dict:
               comp_val, "%", comp_status,
               f"ai_summaries_with_length>50 / total_ai_summaries × 100",
               {"substantive": good, "attempted": attempted}),
+
+            M("ai_column_description_rate", "Column AI Coverage",
+              acd_val, "%", acd_status,
+              "column_profiles_with_non_empty_ai_description / total_column_profiles × 100",
+              {"described_columns": acd_has if cp_ai else 0,
+               "total_columns": acd_total if cp_ai else 0,
+               "ai_description_col": cp_ai or "not found"}),
+
+            M("ai_insight_depth_score", "AI Insight Depth",
+              aid_val, "chars", aid_status,
+              "AVG(LENGTH(ai_summary)) across completed runs — higher = more detailed LLM output",
+              {"avg_summary_length": aid_val,
+               "threshold_healthy": "≥200 chars",
+               "threshold_warning": "100–199 chars"}),
+
+            M("llm_dataset_coverage", "LLM Dataset Coverage",
+              ldc_val, "%", ldc_status,
+              "datasets_with_at_least_one_ai_summarised_run / total_datasets × 100",
+              {"ai_covered_datasets": locals().get("ldc_covered", 0),
+               "total_datasets": locals().get("n_datasets", 0)}),
         ],
         "explainability": {
             "overview": "Global AI/LLM metrics measure whether LLM outputs are actually being produced and are substantive.",
