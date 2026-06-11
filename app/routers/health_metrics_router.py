@@ -48,8 +48,10 @@ def _columns(conn: sqlite3.Connection, table: str) -> set:
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     try:
-        conn.execute(f"SELECT 1 FROM {table} LIMIT 1")
-        return True
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        return row is not None
     except Exception:
         return False
 
@@ -425,24 +427,29 @@ def _tab_global_ai_llm(conn, s, dataset_id) -> dict:
     dur = _duration_stats(conn, s, dataset_id)
 
     # ── response_relevance ────────────────────────────────────────────────────
-    # FIXED: fallback denominator is total profiling_runs (not completed only)
-    if cp_ai:
+    # % of completed profiling runs that generated at least one AI-described column.
+    # Uses cp_run_id_col to link column_profiles back to profiling_runs.
+    cp_run_col = s.get("cp_run_id_col")
+    if cp_run_col and cp_ai and pr_comp:
         row_rr = _one(conn,
-            f"SELECT COUNT(CASE WHEN {cp_ai} IS NOT NULL AND TRIM({cp_ai})!='' THEN 1 END) as has_ai, "
-            f"COUNT(*) as total FROM column_profiles WHERE 1=1 {ds_cp}", cp_p)
-        has_ai   = row_rr["has_ai"] if row_rr else 0
-        rr_total = row_rr["total"]  if row_rr else 0
+            f"SELECT COUNT(DISTINCT {cp_run_col}) as with_ai FROM column_profiles "
+            f"WHERE {cp_ai} IS NOT NULL AND TRIM({cp_ai}) != '' {ds_cp}", cp_p)
+        has_ai = row_rr["with_ai"] if row_rr else 0
+        # Denominator = total completed profiling runs
+        row_tot = _one(conn,
+            f"SELECT COUNT(*) FROM profiling_runs WHERE status = ? {ds_pr}",
+            [pr_comp] + pr_p)
+        rr_total = row_tot[0] if row_tot else 0
+    elif cp_run_col:
+        # ai_description column not found — count runs that produced any column profiles
+        row_rr = _one(conn,
+            f"SELECT COUNT(DISTINCT {cp_run_col}) as with_prof FROM column_profiles "
+            f"WHERE 1=1 {ds_cp}", cp_p)
+        has_ai = row_rr["with_prof"] if row_rr else 0
+        row_tot = _one(conn, f"SELECT COUNT(*) FROM profiling_runs WHERE 1=1 {ds_pr}", pr_p)
+        rr_total = row_tot[0] if row_tot else 0
     else:
-        # Fallback: runs that have any column profiles
-        cp_run_col = s.get("cp_run_id_col")
-        if cp_run_col:
-            row_rr = _one(conn,
-                f"SELECT COUNT(DISTINCT {cp_run_col}) as with_prof FROM column_profiles "
-                f"WHERE 1=1 {ds_cp}", cp_p)
-            has_ai = row_rr["with_prof"] if row_rr else 0
-        else:
-            has_ai = 0
-        # Denominator = total runs regardless of status
+        has_ai = 0
         row_tot = _one(conn, f"SELECT COUNT(*) FROM profiling_runs WHERE 1=1 {ds_pr}", pr_p)
         rr_total = row_tot[0] if row_tot else 0
     rr_val = safe_pct(has_ai, rr_total)
@@ -539,9 +546,10 @@ def _tab_global_ai_llm(conn, s, dataset_id) -> dict:
 
             M("response_relevance", "Response Relevance",
               rr_val, "%", rr_status,
-              "profiling_runs_with_column_profiles / total_profiling_runs × 100",
-              {"with_profiles": has_ai, "total_runs": rr_total,
-               "ai_desc_col": cp_ai or "not found — using run count"}),
+              "completed_runs_with_at_least_one_AI_column_description / completed_runs × 100",
+              {"runs_with_ai_columns": has_ai, "completed_runs": rr_total,
+               "run_fk_col": cp_run_col or "not found",
+               "ai_desc_col": cp_ai or "not found"}),
 
             M("llm_output_schema_compliance_rate", "LLM Output Quality",
               comp_val, "%", comp_status,

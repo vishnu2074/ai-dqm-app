@@ -68,6 +68,7 @@ try:
                         ("nl_text", "TEXT"),
                         ("regex_pattern", "TEXT"),
                         ("meta", "JSON"),
+                        ("source", "TEXT DEFAULT 'manual'"),
                     ]:
                         if col not in existing:
                             conn.exec_driver_sql(f"ALTER TABLE dq_rules ADD COLUMN {col} {defn}")
