@@ -16,7 +16,6 @@ Key improvements over v3:
 import os
 import sqlite3
 import logging
-from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from statistics import mean, stdev as pstdev
 from typing import Optional
@@ -26,31 +25,7 @@ from fastapi import APIRouter, Query
 logger = logging.getLogger("ai_dqm.health_metrics")
 router = APIRouter()
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# DB PATH RESOLUTION — must mirror app/database.py exactly, resolved lazily
-# (NOT at import time) so we never freeze on a stale fallback path.
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _resolve_db_path() -> str:
-    # 1. Explicit override always wins (set by main.py after bootstrap)
-    env_path = os.getenv("DB_PATH")
-    if env_path and Path(env_path).exists():
-        return env_path
-
-    # 2. Render persistent disk (matches database.py's _choose_db_dir)
-    render_path = Path("/var/data/ai-dqm/ai_dqm.db")
-    if render_path.exists():
-        return str(render_path)
-
-    # 3. /tmp fallback (matches database.py local-dev fallback)
-    tmp_path = Path("/tmp/ai-dqm/ai_dqm.db")
-    if tmp_path.exists():
-        return str(tmp_path)
-
-    # 4. Nothing found yet — return env_path or render_path as best guess
-    #    (so error messages show a sensible path even if DB doesn't exist)
-    return env_path or str(render_path)
+DB_PATH = os.getenv("DB_PATH", "/tmp/ai-dqm/ai_dqm.db")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -58,8 +33,7 @@ def _resolve_db_path() -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _conn() -> sqlite3.Connection:
-    db_path = _resolve_db_path()
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -531,16 +505,18 @@ def _tab_global_ai_llm(conn, s, dataset_id) -> dict:
     # non-empty ai_summary. Tells you which datasets are "AI-analysed" vs
     # only technically profiled (schema only, no LLM insight).
     ldc_val, ldc_status = None, "neutral"
+    ldc_covered_out: int = 0
+    ldc_n_datasets_out: int = 0
     if ai_col and pr_comp:
         row_ds_total = _one(conn, "SELECT COUNT(*) as n FROM datasets")
-        n_datasets = row_ds_total["n"] if row_ds_total else 0
-        if n_datasets > 0:
+        ldc_n_datasets_out = row_ds_total["n"] if row_ds_total else 0
+        if ldc_n_datasets_out > 0:
             row_ldc = _one(conn,
                 f"SELECT COUNT(DISTINCT dataset_id) as covered FROM profiling_runs "
                 f"WHERE status = ? AND {ai_col} IS NOT NULL AND TRIM({ai_col}) != '' {ds_pr}",
                 [pr_comp] + pr_p)
-            ldc_covered = row_ldc["covered"] if row_ldc else 0
-            ldc_val    = safe_pct(ldc_covered, n_datasets)
+            ldc_covered_out = row_ldc["covered"] if row_ldc else 0
+            ldc_val    = safe_pct(ldc_covered_out, ldc_n_datasets_out)
             ldc_status = _status(ldc_val, healthy_ge=80, critical_lt=40)
 
     return {
@@ -589,8 +565,8 @@ def _tab_global_ai_llm(conn, s, dataset_id) -> dict:
             M("llm_dataset_coverage", "LLM Dataset Coverage",
               ldc_val, "%", ldc_status,
               "datasets_with_at_least_one_ai_summarised_run / total_datasets × 100",
-              {"ai_covered_datasets": locals().get("ldc_covered", 0),
-               "total_datasets": locals().get("n_datasets", 0)}),
+              {"ai_covered_datasets": ldc_covered_out,
+               "total_datasets": ldc_n_datasets_out}),
         ],
         "explainability": {
             "overview": "Global AI/LLM metrics measure whether LLM outputs are actually being produced and are substantive.",
@@ -881,7 +857,7 @@ def _tab_dq_rules(conn, s, dataset_id) -> dict:
     if act_status:
         row_cov = _one(conn,
             f"SELECT COUNT(DISTINCT dataset_id) as covered FROM dq_rules "
-            f"WHERE status = ?", [act_status])
+            f"WHERE status = ? {ds_r}", [act_status] + r_p)
         covered = row_cov["covered"] if row_cov else 0
     else:
         covered = 0
@@ -1006,6 +982,7 @@ def _tab_monitoring_trends(conn, s, dataset_id) -> dict:
 
     # ── health_score_volatility ───────────────────────────────────────────────
     volatility = None
+    scores: list = []
     if qs_col:
         rows = _all(conn,
             f"SELECT {qs_col} FROM quality_snapshots "
@@ -1044,7 +1021,7 @@ def _tab_monitoring_trends(conn, s, dataset_id) -> dict:
             M("forecast_error_rate", "Health Score Volatility",
               volatility, "pts std", vol_status,
               "stdev(quality_snapshots.score) — Python statistics.stdev",
-              {"samples": len(scores) if qs_col else 0}),
+              {"samples": len(scores)}),
         ],
         "explainability": {
             "overview": "Monitoring tracks profiling activity, drift signal quality, and health score stability.",
@@ -1645,7 +1622,7 @@ async def get_health_metrics(dataset_id: Optional[str] = Query(None)):
         logger.error(f"DB connection failed: {e}")
         return {
             "generated_at": generated_at, "dataset_id": dataset_id,
-            "db_path": _resolve_db_path(), "error": str(e), "tabs": [],
+            "db_path": DB_PATH, "error": str(e), "tabs": [],
         }
 
     try:
@@ -1682,7 +1659,7 @@ async def get_health_metrics(dataset_id: Optional[str] = Query(None)):
         return {
             "generated_at": generated_at,
             "dataset_id":   dataset_id,
-            "db_path":      _resolve_db_path(),
+            "db_path":      DB_PATH,
             "schema_info": {
                 "pr_completed_status":    s["pr_completed_status"],
                 "pr_failed_status":       s["pr_failed_status"],
@@ -1710,7 +1687,7 @@ async def get_health_metrics(dataset_id: Optional[str] = Query(None)):
         logger.error(f"Catastrophic failure: {e}", exc_info=True)
         return {
             "generated_at": generated_at, "dataset_id": dataset_id,
-            "db_path": _resolve_db_path(), "error": str(e), "tabs": [],
+            "db_path": DB_PATH, "error": str(e), "tabs": [],
         }
     finally:
         conn.close()
@@ -1741,15 +1718,7 @@ async def debug_schema():
                 table_columns[tbl] = sorted(_columns(conn2, tbl))
         conn2.close()
         return {
-            "db_path": _resolve_db_path(),
-            "db_path_candidates": {
-                "DB_PATH_env": os.getenv("DB_PATH"),
-                "DB_PATH_env_exists": Path(os.getenv("DB_PATH", "")).exists() if os.getenv("DB_PATH") else None,
-                "render_path": "/var/data/ai-dqm/ai_dqm.db",
-                "render_path_exists": Path("/var/data/ai-dqm/ai_dqm.db").exists(),
-                "tmp_path": "/tmp/ai-dqm/ai_dqm.db",
-                "tmp_path_exists": Path("/tmp/ai-dqm/ai_dqm.db").exists(),
-            },
+            "db_path": DB_PATH,
             "schema_discovery": {k: (sorted(v) if isinstance(v, set) else v) for k, v in s.items()},
             "table_columns": table_columns,
             "critical_checks": {
@@ -1761,4 +1730,4 @@ async def debug_schema():
             },
         }
     except Exception as e:
-        return {"error": str(e), "db_path": _resolve_db_path()}
+        return {"error": str(e), "db_path": DB_PATH}
