@@ -16,6 +16,7 @@ Key improvements over v3:
 import os
 import sqlite3
 import logging
+from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from statistics import mean, stdev as pstdev
 from typing import Optional
@@ -25,7 +26,31 @@ from fastapi import APIRouter, Query
 logger = logging.getLogger("ai_dqm.health_metrics")
 router = APIRouter()
 
-DB_PATH = os.getenv("DB_PATH", "/tmp/ai-dqm/ai_dqm.db")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DB PATH RESOLUTION — must mirror app/database.py exactly, resolved lazily
+# (NOT at import time) so we never freeze on a stale fallback path.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _resolve_db_path() -> str:
+    # 1. Explicit override always wins (set by main.py after bootstrap)
+    env_path = os.getenv("DB_PATH")
+    if env_path and Path(env_path).exists():
+        return env_path
+
+    # 2. Render persistent disk (matches database.py's _choose_db_dir)
+    render_path = Path("/var/data/ai-dqm/ai_dqm.db")
+    if render_path.exists():
+        return str(render_path)
+
+    # 3. /tmp fallback (matches database.py local-dev fallback)
+    tmp_path = Path("/tmp/ai-dqm/ai_dqm.db")
+    if tmp_path.exists():
+        return str(tmp_path)
+
+    # 4. Nothing found yet — return env_path or render_path as best guess
+    #    (so error messages show a sensible path even if DB doesn't exist)
+    return env_path or str(render_path)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -33,7 +58,8 @@ DB_PATH = os.getenv("DB_PATH", "/tmp/ai-dqm/ai_dqm.db")
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    db_path = _resolve_db_path()
+    conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -1619,7 +1645,7 @@ async def get_health_metrics(dataset_id: Optional[str] = Query(None)):
         logger.error(f"DB connection failed: {e}")
         return {
             "generated_at": generated_at, "dataset_id": dataset_id,
-            "db_path": DB_PATH, "error": str(e), "tabs": [],
+            "db_path": _resolve_db_path(), "error": str(e), "tabs": [],
         }
 
     try:
@@ -1656,7 +1682,7 @@ async def get_health_metrics(dataset_id: Optional[str] = Query(None)):
         return {
             "generated_at": generated_at,
             "dataset_id":   dataset_id,
-            "db_path":      DB_PATH,
+            "db_path":      _resolve_db_path(),
             "schema_info": {
                 "pr_completed_status":    s["pr_completed_status"],
                 "pr_failed_status":       s["pr_failed_status"],
@@ -1684,7 +1710,7 @@ async def get_health_metrics(dataset_id: Optional[str] = Query(None)):
         logger.error(f"Catastrophic failure: {e}", exc_info=True)
         return {
             "generated_at": generated_at, "dataset_id": dataset_id,
-            "db_path": DB_PATH, "error": str(e), "tabs": [],
+            "db_path": _resolve_db_path(), "error": str(e), "tabs": [],
         }
     finally:
         conn.close()
@@ -1715,7 +1741,15 @@ async def debug_schema():
                 table_columns[tbl] = sorted(_columns(conn2, tbl))
         conn2.close()
         return {
-            "db_path": DB_PATH,
+            "db_path": _resolve_db_path(),
+            "db_path_candidates": {
+                "DB_PATH_env": os.getenv("DB_PATH"),
+                "DB_PATH_env_exists": Path(os.getenv("DB_PATH", "")).exists() if os.getenv("DB_PATH") else None,
+                "render_path": "/var/data/ai-dqm/ai_dqm.db",
+                "render_path_exists": Path("/var/data/ai-dqm/ai_dqm.db").exists(),
+                "tmp_path": "/tmp/ai-dqm/ai_dqm.db",
+                "tmp_path_exists": Path("/tmp/ai-dqm/ai_dqm.db").exists(),
+            },
             "schema_discovery": {k: (sorted(v) if isinstance(v, set) else v) for k, v in s.items()},
             "table_columns": table_columns,
             "critical_checks": {
@@ -1727,4 +1761,4 @@ async def debug_schema():
             },
         }
     except Exception as e:
-        return {"error": str(e), "db_path": DB_PATH}
+        return {"error": str(e), "db_path": _resolve_db_path()}
