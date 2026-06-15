@@ -1674,6 +1674,14 @@ def _tab_azure_llm(conn) -> dict:
     last_call_at      = _v("last_call_at")
     models_breakdown  = _v("models") or []
     recent_calls      = _v("recent_calls") or []
+    # Cost fields
+    cost_usd          = _v("cost_usd")
+    prev_cost_usd     = _v("prev_window_cost_usd")
+    cost_trend_pct    = _v("cost_trend_pct")
+    avg_cost_per_call = _v("avg_cost_per_call_usd")
+    alltime_cost_usd  = _v("alltime_cost_usd")
+    price_input_per_m = _v("price_input_per_m")
+    price_output_per_m= _v("price_output_per_m")
 
     # ── token_efficiency ──────────────────────────────────────────────────────
     # % of all tokens that are completions (output).
@@ -1742,12 +1750,8 @@ def _tab_azure_llm(conn) -> dict:
             "critical"
         )
 
-    # ── cost ──────────────────────────────────────────────────────────────────
-    # Only from Azure Cost Management API — null if unavailable.
-    cost_amount   = actual_cost.get("amount")   if isinstance(actual_cost, dict) else None
-    cost_currency = actual_cost.get("currency") if isinstance(actual_cost, dict) else "USD"
-    # Status: healthy = got a real number from Azure; neutral = no billing data
-    cost_status = "healthy" if cost_amount is not None else "neutral"
+    # ── cost status ───────────────────────────────────────────────────────────
+    # Status derived purely from actual cost value
 
     not_configured_note = (
         "Set AZURE_SUBSCRIPTION_ID, AZURE_RESOURCE_GROUP, AZURE_OPENAI_RESOURCE, "
@@ -1827,11 +1831,27 @@ def _tab_azure_llm(conn) -> dict:
               "throttled_calls / total_calls × 100 (requires Azure Monitor for full accuracy)",
               {"throttled": throttled_count, "total_requests": total_requests}),
 
-            M("azure_actual_cost", "Actual Cost",
-              cost_amount, cost_currency, cost_status,
-              "Azure Cost Management API — actual billed cost. null = no billing data yet.",
-              {"currency": cost_currency,
-               "note": "Requires Cost Management Reader role on the subscription"}),
+            M("azure_actual_cost", f"LLM Cost (last {window_hours}h)",
+              round(cost_usd, 6) if cost_usd is not None else None,
+              "USD",
+              "neutral" if cost_usd is None else (
+                  "healthy" if (cost_usd or 0) < 1.0 else
+                  "warning" if (cost_usd or 0) < 10.0 else
+                  "critical"
+              ),
+              f"(prompt_tokens/1M × ${price_input_per_m or 0.71}) + "
+              f"(completion_tokens/1M × ${price_output_per_m or 0.71}) "
+              f"— published Azure AI Foundry rate for {deployment or 'Llama-3.3-70B-Instruct'}",
+              {"window_cost_usd":        round(cost_usd, 6) if cost_usd else 0,
+               "prev_window_cost_usd":   round(prev_cost_usd, 6) if prev_cost_usd else 0,
+               "cost_trend_pct":         cost_trend_pct,
+               "avg_cost_per_call_usd":  avg_cost_per_call,
+               "alltime_cost_usd":       alltime_cost_usd,
+               "prompt_tokens":          prompt_tokens,
+               "completion_tokens":      completion_tokens,
+               "price_input_per_1m":     price_input_per_m,
+               "price_output_per_1m":    price_output_per_m,
+               "pricing_source":         "Azure AI Foundry marketplace, verified June 2026"}),
         ],
         "explainability": {
             "overview": (
@@ -1849,6 +1869,14 @@ def _tab_azure_llm(conn) -> dict:
             "window_hours":       window_hours,
             "alltime_calls":      alltime_calls,
             "alltime_tokens":     alltime_tokens,
+            "alltime_cost_usd":   alltime_cost_usd,
+            "pricing": {
+                "model":              deployment,
+                "input_per_1m_usd":   price_input_per_m,
+                "output_per_1m_usd":  price_output_per_m,
+                "source":             "Azure AI Foundry marketplace, verified June 2026",
+                "override_env_vars":  "LLM_PRICE_INPUT_PER_M, LLM_PRICE_OUTPUT_PER_M",
+            },
             "models_in_window":   [m.get("model") for m in models_breakdown],
             "recent_calls":       recent_calls,
         },
@@ -2045,3 +2073,48 @@ async def refresh_azure_metrics():
         return {"success": False, "reason": "azure_metrics_collector not installed"}
     except Exception as e:
         return {"success": False, "reason": str(e)}
+
+
+@router.get("/api/azure-metrics/debug", include_in_schema=False)
+async def debug_llm_usage():
+    """
+    Shows the last 20 LLM calls with full error messages so you can
+    diagnose why calls are failing. Hit this after a profiling run.
+    """
+    try:
+        from app.routers.azure_metrics_collector import ensure_table, DB_PATH as AZ_DB
+        import sqlite3 as _sq
+        ensure_table()
+        conn = _sq.connect(AZ_DB)
+        conn.row_factory = _sq.Row
+        rows = conn.execute("""
+            SELECT id, called_at, model, prompt_tokens, completion_tokens,
+                   total_tokens, cost_usd, latency_ms, status, error_message, caller
+            FROM llm_usage_log
+            ORDER BY id DESC LIMIT 20
+        """).fetchall()
+        summary = conn.execute("""
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) as successes,
+                SUM(CASE WHEN status='error'   THEN 1 ELSE 0 END) as errors,
+                SUM(prompt_tokens)     as total_prompt,
+                SUM(completion_tokens) as total_completion,
+                SUM(cost_usd)          as total_cost
+            FROM llm_usage_log
+        """).fetchone()
+        conn.close()
+        return {
+            "summary": dict(summary),
+            "last_20_calls": [dict(r) for r in rows],
+            "diagnosis": (
+                "All calls are errors with 0 tokens — check error_message field above "
+                "to see why the LLM calls are failing. Common causes: wrong endpoint URL, "
+                "invalid API key, model name mismatch, or the call path doesn't go through "
+                "get_llm_client()."
+                if dict(summary)["errors"] == dict(summary)["total"] and dict(summary)["total"] > 0
+                else "OK"
+            )
+        }
+    except Exception as e:
+        return {"error": str(e)}
