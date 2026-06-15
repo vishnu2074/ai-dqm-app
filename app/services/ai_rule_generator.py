@@ -18,8 +18,10 @@ import os
 import re
 from typing import Any, Dict, List, Optional
 
+import time as _time
 import pandas as pd
 import requests as _http
+from app.services.llm_tracker import track_llm_call
 
 _KEY      = os.getenv("AZURE_OPENAI_API_KEY", "")
 _ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
@@ -32,6 +34,7 @@ def _llm(prompt: str, max_tokens: int = 1500) -> Optional[str]:
     if not _KEY or not _ENDPOINT:
         return None
     url = f"{_ENDPOINT}/chat/completions"
+    _t0 = _time.time()
     try:
         r = _http.post(
             url,
@@ -44,14 +47,33 @@ def _llm(prompt: str, max_tokens: int = 1500) -> Optional[str]:
             timeout=45,
         )
         r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"]
+        body = r.json()
+        content_out = body["choices"][0]["message"]["content"]
+        usage = body.get("usage", {})
+        track_llm_call(
+            feature="dq_rules", model=_MODEL,
+            prompt_tokens=usage.get("prompt_tokens"),
+            completion_tokens=usage.get("completion_tokens"),
+            latency_ms=(_time.time() - _t0) * 1000,
+            success=True, input_length=len(prompt), output_length=len(content_out or ""),
+        )
+        return content_out
     except _http.exceptions.ConnectionError as e:
+        track_llm_call(feature="dq_rules", model=_MODEL,
+            latency_ms=(_time.time() - _t0) * 1000, success=False,
+            error_type="ConnectionError", input_length=len(prompt))
         print(f"[ai_rule_generator] Connection error: {e}")
         return None
     except _http.exceptions.Timeout:
+        track_llm_call(feature="dq_rules", model=_MODEL,
+            latency_ms=(_time.time() - _t0) * 1000, success=False,
+            error_type="Timeout", input_length=len(prompt))
         print(f"[ai_rule_generator] Request timed out")
         return None
     except Exception as e:
+        track_llm_call(feature="dq_rules", model=_MODEL,
+            latency_ms=(_time.time() - _t0) * 1000, success=False,
+            error_type=type(e).__name__, input_length=len(prompt))
         print(f"[ai_rule_generator] LLM error: {e}")
         return None
 

@@ -18,6 +18,7 @@ from datetime import datetime, timezone, timedelta
 
 from typing import Any, Dict, List, Optional, Set, Tuple
  
+import time as _time
 import requests as _http
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -43,6 +44,8 @@ _ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
 _MODEL    = os.getenv("AZURE_OPENAI_MODEL", "Llama-3.3-70B-Instruct")
 
 _VERSION  = os.getenv("AZURE_OPENAI_API_VERSION", "2024-05-01-preview")
+
+from app.services.llm_tracker import track_llm_call
  
  
 def _llm(prompt: str, max_tokens: int = 1500) -> Optional[str]:
@@ -71,6 +74,8 @@ def _llm(prompt: str, max_tokens: int = 1500) -> Optional[str]:
 
     }
 
+    _t0 = _time.time()
+
     try:
 
         r = _http.post(url, headers=headers, json=payload,
@@ -79,9 +84,29 @@ def _llm(prompt: str, max_tokens: int = 1500) -> Optional[str]:
 
         r.raise_for_status()
 
-        return r.json()["choices"][0]["message"]["content"]
+        body = r.json()
+
+        out = body["choices"][0]["message"]["content"]
+
+        usage = body.get("usage", {})
+
+        track_llm_call(
+            feature="policy", model=_MODEL,
+            prompt_tokens=usage.get("prompt_tokens"),
+            completion_tokens=usage.get("completion_tokens"),
+            latency_ms=(_time.time() - _t0) * 1000,
+            success=True, input_length=len(prompt), output_length=len(out or ""),
+        )
+
+        return out
 
     except Exception as e:
+
+        track_llm_call(
+            feature="policy", model=_MODEL,
+            latency_ms=(_time.time() - _t0) * 1000,
+            success=False, error_type=type(e).__name__, input_length=len(prompt),
+        )
 
         logger.error(f"[policy_suggestions] LLM error: {e}")
 

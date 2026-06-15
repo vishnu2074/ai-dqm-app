@@ -13,6 +13,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+import time as _time
 import requests as _http
 from sqlalchemy import desc
 from sqlalchemy.orm import Session
@@ -21,6 +22,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from app.models import Dataset, DQRule, DQRuleChangeLog, ProfilingRun, QualityCheck
+from app.services.llm_tracker import track_llm_call
 
 # ─── Azure AI Foundry HTTP client ─────────────────────────────────────────────
 
@@ -50,16 +52,36 @@ def _llm(prompt: str, max_tokens: int = 800) -> Optional[str]:
         "temperature": 0.2,
         "max_tokens":  max_tokens,
     }
+    _t0 = _time.time()
     try:
         r = _http.post(url, headers=headers, json=payload,
                        timeout=40)
         r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"]
+        body = r.json()
+        out = body["choices"][0]["message"]["content"]
+        usage = body.get("usage", {})
+        track_llm_call(
+            feature="anomaly", model=_MODEL,
+            prompt_tokens=usage.get("prompt_tokens"),
+            completion_tokens=usage.get("completion_tokens"),
+            latency_ms=(_time.time() - _t0) * 1000,
+            success=True, input_length=len(prompt), output_length=len(out or ""),
+        )
+        return out
     except _http.exceptions.ConnectionError as e:
+        track_llm_call(feature="anomaly", model=_MODEL,
+            latency_ms=(_time.time() - _t0) * 1000, success=False,
+            error_type="ConnectionError", input_length=len(prompt))
         print(f"[anomalies] LLM connection error: {e}")
     except _http.exceptions.Timeout:
+        track_llm_call(feature="anomaly", model=_MODEL,
+            latency_ms=(_time.time() - _t0) * 1000, success=False,
+            error_type="Timeout", input_length=len(prompt))
         print("[anomalies] LLM request timed out")
     except Exception as e:
+        track_llm_call(feature="anomaly", model=_MODEL,
+            latency_ms=(_time.time() - _t0) * 1000, success=False,
+            error_type=type(e).__name__, input_length=len(prompt))
         print(f"[anomalies] LLM error: {e}")
     return None
 

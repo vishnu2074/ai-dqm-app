@@ -7,6 +7,8 @@ try:
     import httpx
 except ImportError:
     httpx = None
+import time as _time
+from app.services.llm_tracker import track_llm_call
 import requests as _http
 from datetime import timedelta, timezone
 from typing import Any
@@ -311,16 +313,31 @@ Rules: PascalCase 1-3 words. Be specific (CustomerID not just ID). Never purely 
 Respond ONLY with valid JSON: {{"column_name": "SemanticLabel", ...}}
 Columns:
 {chr(10).join(col_descs)}"""
+    _t0 = _time.time()
     try:
         resp = httpx.post("https://api.anthropic.com/v1/messages",
             headers={"x-api-key":api_key,"anthropic-version":"2023-06-01","content-type":"application/json"},
             json={"model":"claude-haiku-4-5-20251001","max_tokens":512,"messages":[{"role":"user","content":prompt}]},
             timeout=30.0)
         resp.raise_for_status()
-        raw = resp.json()["content"][0]["text"].strip()
+        body = resp.json()
+        raw = body["content"][0]["text"].strip()
+        usage = body.get("usage", {})
+        track_llm_call(
+            feature="profiling", model="claude-haiku-4-5-20251001",
+            prompt_tokens=usage.get("input_tokens"),
+            completion_tokens=usage.get("output_tokens"),
+            latency_ms=(_time.time() - _t0) * 1000,
+            success=True, input_length=len(prompt), output_length=len(raw),
+        )
         if raw.startswith("```"): raw = re.sub(r"^```[a-z]*\n?","",raw); raw = re.sub(r"\n?```$","",raw)
         return json.loads(raw)
     except Exception as e:
+        track_llm_call(
+            feature="profiling", model="claude-haiku-4-5-20251001",
+            latency_ms=(_time.time() - _t0) * 1000,
+            success=False, error_type=type(e).__name__, input_length=len(prompt),
+        )
         print(f"[profiling] AI semantic labeling failed (non-fatal): {e}")
         return {}
 
@@ -351,12 +368,26 @@ def _ai_dataset_description(ds_name: str, total_rows: int, columns: list[dict], 
                 f"Be specific to this dataset. No markdown headers. Plain paragraphs and bullets only."
             )
             model_name = os.getenv("AZURE_OPENAI_DEPLOYMENT", os.getenv("AZURE_OPENAI_MODEL", "Llama-3.3-70B-Instruct"))
+            _t0 = _time.time()
             response = client.chat.completions.create(model=model_name, messages=[{"role": "user", "content": prompt}], temperature=0.3, max_tokens=600)
             raw = response.choices[0].message.content
+            usage = getattr(response, "usage", None)
+            track_llm_call(
+                feature="profiling", model=model_name,
+                prompt_tokens=getattr(usage, "prompt_tokens", None) if usage else None,
+                completion_tokens=getattr(usage, "completion_tokens", None) if usage else None,
+                latency_ms=(_time.time() - _t0) * 1000,
+                success=True, input_length=len(prompt), output_length=len(raw or ""),
+            )
             if raw and len(raw.strip()) > 80:
                 print(f"[profiling] ✓ AI description generated via LLM client ({len(raw)} chars)")
                 return raw.strip()
     except Exception as e:
+        track_llm_call(
+            feature="profiling", model=os.getenv("AZURE_OPENAI_MODEL", "Llama-3.3-70B-Instruct"),
+            latency_ms=(_time.time() - _t0) * 1000 if "_t0" in dir() else 0,
+            success=False, error_type=type(e).__name__, input_length=len(prompt),
+        )
         print(f"[profiling] LLM client description failed (non-fatal): {e}")
 
     # Priority 2: Fallback to raw HTTP with CORRECT auth (Bearer token)
@@ -373,14 +404,29 @@ def _ai_dataset_description(ds_name: str, total_rows: int, columns: list[dict], 
                 f"Columns: {', '.join(c['columnName'] for c in columns[:10])}. Plain paragraphs only, no markdown."
             )
             model_name = os.getenv("AZURE_OPENAI_DEPLOYMENT", os.getenv("AZURE_OPENAI_MODEL", "Llama-3.3-70B-Instruct"))
+            _t1 = _time.time()
             r = _http.post(f"{_ENDPOINT}/v1/chat/completions", headers={"Content-Type": "application/json", "Authorization": f"Bearer {_KEY}"},
                 json={"model": model_name, "messages": [{"role": "user", "content": prompt}], "temperature": 0.3, "max_tokens": 600}, timeout=35)
             r.raise_for_status()
-            raw = r.json()["choices"][0]["message"]["content"]
+            body = r.json()
+            raw = body["choices"][0]["message"]["content"]
+            usage = body.get("usage", {})
+            track_llm_call(
+                feature="profiling", model=model_name,
+                prompt_tokens=usage.get("prompt_tokens"),
+                completion_tokens=usage.get("completion_tokens"),
+                latency_ms=(_time.time() - _t1) * 1000,
+                success=True, input_length=len(prompt), output_length=len(raw or ""),
+            )
             if raw and len(raw.strip()) > 80:
                 print(f"[profiling] ✓ AI description generated via HTTP ({len(raw)} chars)")
                 return raw.strip()
         except Exception as e:
+            track_llm_call(
+                feature="profiling", model=os.getenv("AZURE_OPENAI_MODEL", "Llama-3.3-70B-Instruct"),
+                latency_ms=(_time.time() - _t1) * 1000 if "_t1" in dir() else 0,
+                success=False, error_type=type(e).__name__, input_length=len(prompt),
+            )
             print(f"[profiling] HTTP AI description failed (non-fatal): {e}")
 
     # Priority 3: Fallback to template

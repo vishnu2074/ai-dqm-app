@@ -17,6 +17,9 @@ from app.agents.profiling_agent import ProfilingAgent
 from app.agents.relationship_agent import RelationshipAgent
 from app.models import Dataset, KnowledgeGraphEdge
 from app.services.dq_scores import _load_dataframe_for_dataset
+import time as _time
+import json as _json
+from app.services.llm_tracker import track_llm_call
 
 
 class KnowledgeGraphService:
@@ -427,7 +430,25 @@ class KnowledgeGraphService:
 
         # LLM pass for edge suggestions
         llm_agent = LLMAgent()
-        llm_edges = llm_agent.generate_kg(metadata_map).get("edges", [])
+        _t0 = _time.time()
+        try:
+            _kg_result = llm_agent.generate_kg(metadata_map)
+            llm_edges = _kg_result.get("edges", [])
+            track_llm_call(
+                feature="kg", model=os.getenv("AZURE_OPENAI_MODEL", "Llama-3.3-70B-Instruct"),
+                latency_ms=(_time.time() - _t0) * 1000,
+                success=True,
+                input_length=len(_json.dumps(metadata_map, default=str)),
+                output_length=len(_json.dumps(llm_edges, default=str)),
+            )
+        except Exception as _kg_e:
+            llm_edges = []
+            track_llm_call(
+                feature="kg", model=os.getenv("AZURE_OPENAI_MODEL", "Llama-3.3-70B-Instruct"),
+                latency_ms=(_time.time() - _t0) * 1000,
+                success=False, error_type=type(_kg_e).__name__,
+                input_length=len(_json.dumps(metadata_map, default=str)),
+            )
 
         rel_agent = RelationshipAgent()
         matching_agent = MatchingAgent()
@@ -515,7 +536,25 @@ class KnowledgeGraphService:
 
         # LLM pass
         llm_agent = LLMAgent()
-        llm_edges = llm_agent.generate_kg(metadata_map).get("edges", [])
+        _t0b = _time.time()
+        try:
+            _kg_result2 = llm_agent.generate_kg(metadata_map)
+            llm_edges = _kg_result2.get("edges", [])
+            track_llm_call(
+                feature="kg", model=os.getenv("AZURE_OPENAI_MODEL", "Llama-3.3-70B-Instruct"),
+                latency_ms=(_time.time() - _t0b) * 1000,
+                success=True,
+                input_length=len(_json.dumps(metadata_map, default=str)),
+                output_length=len(_json.dumps(llm_edges, default=str)),
+            )
+        except Exception as _kg_e2:
+            llm_edges = []
+            track_llm_call(
+                feature="kg", model=os.getenv("AZURE_OPENAI_MODEL", "Llama-3.3-70B-Instruct"),
+                latency_ms=(_time.time() - _t0b) * 1000,
+                success=False, error_type=type(_kg_e2).__name__,
+                input_length=len(_json.dumps(metadata_map, default=str)),
+            )
 
         rel_agent = RelationshipAgent()
         matching_agent = MatchingAgent()

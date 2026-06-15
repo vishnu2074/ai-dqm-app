@@ -55,6 +55,8 @@ from app.models import (
     QualityCheck, DriftRecord, SchemaHistory,
     DQRule, DQRuleRun, DQRuleRunResult,
 )
+import time as _time
+from app.services.llm_tracker import track_llm_call
 
 # ─── LLM ──────────────────────────────────────────────────────────────────────
 
@@ -69,16 +71,31 @@ def _client() -> OpenAI:
 
 
 def _llm(system: str, user: str, history: List[Dict] = None, max_tokens: int = 900) -> str:
+    _t0 = _time.time()
+    msgs = [{"role": "system", "content": system}]
+    if history:
+        msgs.extend(history[-8:])
+    msgs.append({"role": "user", "content": user})
     try:
-        msgs = [{"role": "system", "content": system}]
-        if history:
-            msgs.extend(history[-8:])
-        msgs.append({"role": "user", "content": user})
         resp = _client().chat.completions.create(
             model=_MODEL, messages=msgs, temperature=0.3, max_tokens=max_tokens,
         )
-        return resp.choices[0].message.content.strip()
+        out = resp.choices[0].message.content.strip()
+        usage = getattr(resp, "usage", None)
+        track_llm_call(
+            feature="agent", model=_MODEL,
+            prompt_tokens=getattr(usage, "prompt_tokens", None) if usage else None,
+            completion_tokens=getattr(usage, "completion_tokens", None) if usage else None,
+            latency_ms=(_time.time() - _t0) * 1000,
+            success=True, input_length=len(user), output_length=len(out),
+        )
+        return out
     except Exception as e:
+        track_llm_call(
+            feature="agent", model=_MODEL,
+            latency_ms=(_time.time() - _t0) * 1000,
+            success=False, error_type=type(e).__name__, input_length=len(user),
+        )
         return f"LLM error: {e}"
 
 
