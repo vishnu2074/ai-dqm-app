@@ -462,12 +462,16 @@ def get_llm_client():
 
     try:
         from openai import OpenAI
-        # Use /v1 path for Azure AI Foundry
-        _llm_client_instance = OpenAI(
+        from app.routers.azure_metrics_collector import TrackedOpenAIClient, ensure_table
+        # Ensure the usage log table exists
+        ensure_table()
+        # Wrap the raw client so every call records token usage + latency
+        raw = OpenAI(
             base_url=f"{endpoint}/v1",
             api_key=api_key,
         )
-        print(f"[llm] Client initialised → {endpoint}/v1")
+        _llm_client_instance = TrackedOpenAIClient(raw, caller_label="profiling")
+        print(f"[llm] Client initialised → {endpoint}/v1 (usage tracking enabled)")
         return _llm_client_instance
     except Exception as e:
         _STARTUP_ERRORS.append(f"llm_client_init: {e}")
@@ -614,6 +618,26 @@ def _reg_health_metrics():
     app.include_router(hm_router)
 _load("health_metrics_router", _reg_health_metrics)
 
+
+def _start_azure_metrics_init():
+    """
+    Verify azure_metrics_collector is importable and log configuration status.
+    Metrics are fetched live per request (5-min in-process cache) — no DB
+    table or background thread needed.
+    """
+    try:
+        from app.routers.azure_metrics_collector import is_configured
+        if is_configured():
+            print("[startup] Azure metrics: credentials configured ✓")
+        else:
+            print("[startup] Azure metrics: AZURE_* env vars not set — tab will show 'Not configured'")
+    except ImportError:
+        _STARTUP_ERRORS.append("azure_metrics_collector: azure-identity or azure-monitor-query not installed")
+        print("[startup] Azure metrics: pip install azure-identity azure-monitor-query")
+    except Exception as e:
+        _STARTUP_ERRORS.append(f"azure_metrics_init: {e}")
+
+_load("azure_metrics_init", _start_azure_metrics_init)
 
 # ── Frontend static files ─────────────────────────────────────────────────────
 _THIS_FILE = _Path(__file__).resolve()

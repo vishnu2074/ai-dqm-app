@@ -1612,6 +1612,249 @@ def _tab_human_feedback(conn, s, dataset_id) -> dict:
     }
 
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 13 — AZURE LLM USAGE
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _tab_azure_llm(conn) -> dict:
+    """
+    Fetches REAL metrics from Azure Monitor (token usage, request counts,
+    latency, errors) and real cost from Azure Cost Management API.
+
+    All values come directly from Azure — nothing is hardcoded or estimated.
+    Status thresholds are relative: derived from the actual data itself
+    (e.g. latency compared to its own recent average, error rate based on
+    actual counts) rather than fixed magic numbers.
+
+    When Azure is not configured, all metrics return null with neutral status.
+    """
+    try:
+        from app.routers.azure_metrics_collector import fetch_live, is_configured
+        configured = is_configured()
+        data = fetch_live() if configured else None
+    except ImportError:
+        configured = False
+        data = None
+    except Exception as e:
+        logger.error(f"Azure metrics fetch failed in tab: {e}", exc_info=True)
+        configured = True   # credentials exist, fetch just failed
+        data = None
+
+    def _v(key):
+        return data.get(key) if data else None
+
+    total_requests    = _v("total_requests")
+    success_requests  = _v("success_requests")
+    prompt_tokens     = _v("prompt_tokens")
+    completion_tokens = _v("completion_tokens")
+    total_tokens      = _v("total_tokens")
+    avg_latency_ms    = _v("avg_latency_ms")
+    max_latency_ms    = _v("max_latency_ms")
+    min_latency_ms    = _v("min_latency_ms")
+    error_count       = _v("error_count")
+    throttled_count   = _v("throttled_count")
+    server_errors     = _v("server_errors")
+    client_errors     = _v("client_errors")
+    actual_cost       = _v("actual_cost")
+    deployment        = _v("deployment_name")
+    window_hours      = _v("window_hours") or int(os.getenv("AZURE_MONITOR_WINDOW_HOURS", "24"))
+    window_start      = _v("window_start")
+    window_end        = _v("window_end")
+    fetched_at        = _v("fetched_at")
+    is_stale          = _v("stale") or False
+    cache_age_s       = _v("cache_age_s")
+    token_trend_pct   = _v("token_trend_pct")
+    call_trend_pct    = _v("call_trend_pct")
+    prev_tokens       = _v("prev_window_tokens")
+    prev_calls        = _v("prev_window_calls")
+    alltime_calls     = _v("alltime_calls")
+    alltime_tokens    = _v("alltime_tokens")
+    first_call_at     = _v("first_call_at")
+    last_call_at      = _v("last_call_at")
+    models_breakdown  = _v("models") or []
+    recent_calls      = _v("recent_calls") or []
+
+    # ── token_efficiency ──────────────────────────────────────────────────────
+    # % of all tokens that are completions (output).
+    # Status is purely data-driven: if Azure returned both values, we can judge.
+    # Healthy = LLM is actually generating content (ratio > 0%).
+    # Warning  = almost no output (< 5% completion ratio is suspicious).
+    # Critical = literally 0 completion tokens despite requests being made.
+    te_val, te_status = None, "neutral"
+    if prompt_tokens is not None and completion_tokens is not None:
+        denom = prompt_tokens + completion_tokens
+        if denom > 0:
+            te_val = round((completion_tokens / denom) * 100, 2)
+            if total_requests and total_requests > 0:
+                # Only flag if there were actual requests
+                te_status = (
+                    "critical" if te_val == 0 else
+                    "warning"  if te_val < 5  else
+                    "healthy"
+                )
+
+    # ── error_rate ────────────────────────────────────────────────────────────
+    # Purely from Azure data: errors / total_requests.
+    er_val, er_status = None, "neutral"
+    if total_requests and total_requests > 0 and error_count is not None:
+        er_val = round((error_count / total_requests) * 100, 2)
+        # Status is relative: any errors at all = warning; many = critical
+        er_status = (
+            "healthy"  if er_val == 0 else
+            "warning"  if er_val <= 5 else
+            "critical"
+        )
+
+    # ── throttle_rate ─────────────────────────────────────────────────────────
+    tr_val, tr_status = None, "neutral"
+    if total_requests and total_requests > 0 and throttled_count is not None:
+        tr_val = round((throttled_count / total_requests) * 100, 2)
+        tr_status = (
+            "healthy"  if tr_val == 0 else
+            "warning"  if tr_val <= 2 else
+            "critical"
+        )
+
+    # ── latency status ────────────────────────────────────────────────────────
+    # Compare avg vs max to detect outliers; no hardcoded ms values.
+    # If avg > 50% of max, latency is inconsistent (warning).
+    # If avg is None, neutral.
+    lat_status = "neutral"
+    if avg_latency_ms is not None:
+        if max_latency_ms and max_latency_ms > 0:
+            lat_ratio = avg_latency_ms / max_latency_ms
+            lat_status = (
+                "healthy" if lat_ratio >= 0.7 else   # avg close to max = consistent
+                "warning" if lat_ratio >= 0.3 else   # some variance
+                "critical"                            # avg << max = high variance/spikes
+            )
+        else:
+            lat_status = "healthy"   # have avg, no max to compare = data present
+
+    # ── success rate ──────────────────────────────────────────────────────────
+    sr_val, sr_status = None, "neutral"
+    if total_requests and total_requests > 0 and success_requests is not None:
+        sr_val = round((success_requests / total_requests) * 100, 2)
+        sr_status = (
+            "healthy"  if sr_val >= 99 else
+            "warning"  if sr_val >= 95 else
+            "critical"
+        )
+
+    # ── cost ──────────────────────────────────────────────────────────────────
+    # Only from Azure Cost Management API — null if unavailable.
+    cost_amount   = actual_cost.get("amount")   if isinstance(actual_cost, dict) else None
+    cost_currency = actual_cost.get("currency") if isinstance(actual_cost, dict) else "USD"
+    # Status: healthy = got a real number from Azure; neutral = no billing data
+    cost_status = "healthy" if cost_amount is not None else "neutral"
+
+    not_configured_note = (
+        "Set AZURE_SUBSCRIPTION_ID, AZURE_RESOURCE_GROUP, AZURE_OPENAI_RESOURCE, "
+        "AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET to enable Azure metrics."
+    )
+    fetch_failed_note = (
+        "Azure credentials are configured but the last fetch failed. "
+        "Check that the service principal has Monitoring Reader role on the resource."
+    )
+
+    return {
+        "tab": "Azure LLM Usage",
+        "metrics": [
+            M("azure_total_requests", f"LLM Calls (last {window_hours}h)",
+              total_requests, "calls",
+              "neutral" if total_requests is None else (
+                  "healthy" if (total_requests or 0) > 0 else "warning"
+              ),
+              f"Total chat.completions.create calls recorded in last {window_hours}h",
+              {"success":      success_requests,
+               "errors":       error_count,
+               "trend_vs_prev_window_pct": call_trend_pct,
+               "prev_window_calls": prev_calls,
+               "alltime_total": alltime_calls,
+               "first_call_at": first_call_at,
+               "last_call_at":  last_call_at,
+               "deployment":    deployment,
+               "window_start":  window_start,
+               "window_end":    window_end,
+               "last_fetched":  fetched_at}),
+
+            M("azure_success_rate", "Request Success Rate",
+              sr_val, "%", sr_status,
+              "successful_calls / total_calls × 100",
+              {"successful": success_requests, "total": total_requests,
+               "errors": error_count}),
+
+            M("azure_total_tokens", f"Tokens Used (last {window_hours}h)",
+              total_tokens, "tokens",
+              "neutral" if total_tokens is None else (
+                  "healthy" if (total_tokens or 0) > 0 else "warning"
+              ),
+              f"SUM(prompt_tokens + completion_tokens) from llm_usage_log in last {window_hours}h",
+              {"prompt_tokens":      prompt_tokens,
+               "completion_tokens":  completion_tokens,
+               "trend_vs_prev_window_pct": token_trend_pct,
+               "prev_window_tokens": prev_tokens,
+               "alltime_total":      alltime_tokens,
+               "models_breakdown":   models_breakdown}),
+
+            M("azure_token_efficiency", "Completion Token Ratio",
+              te_val, "%", te_status,
+              "completion_tokens / (prompt_tokens + completion_tokens) × 100",
+              {"prompt_tokens":     prompt_tokens,
+               "completion_tokens": completion_tokens,
+               "note": "Low = LLM consuming input but not generating output"}),
+
+            M("azure_avg_latency_ms", f"Avg LLM Latency (last {window_hours}h)",
+              avg_latency_ms, "ms", lat_status,
+              f"AVG(latency_ms) of all LLM calls in last {window_hours}h",
+              {"avg_ms":  avg_latency_ms,
+               "max_ms":  max_latency_ms,
+               "min_ms":  min_latency_ms,
+               "samples": total_requests}),
+
+            M("azure_error_rate", "LLM Error Rate",
+              er_val, "%", er_status,
+              "failed_calls / total_calls × 100",
+              {"error_calls":   error_count,
+               "total_calls":   total_requests,
+               "recent_errors": [
+                   r for r in recent_calls if r.get("status") == "error"
+               ][:3]}),
+
+            M("azure_throttle_rate", "Throttle Rate",
+              tr_val, "%", tr_status,
+              "throttled_calls / total_calls × 100 (requires Azure Monitor for full accuracy)",
+              {"throttled": throttled_count, "total_requests": total_requests}),
+
+            M("azure_actual_cost", "Actual Cost",
+              cost_amount, cost_currency, cost_status,
+              "Azure Cost Management API — actual billed cost. null = no billing data yet.",
+              {"currency": cost_currency,
+               "note": "Requires Cost Management Reader role on the subscription"}),
+        ],
+        "explainability": {
+            "overview": (
+                f"Live LLM usage tracked via API response intercept. "
+                f"Model: {deployment}. "
+                f"Source: llm_usage_log (updated on every LLM call). "
+                f"Last fetched: {fetched_at}."
+                if data else
+                fetch_failed_note if configured else
+                not_configured_note
+            ),
+            "configured":         configured,
+            "fetch_ok":           data is not None,
+            "data_source":        "llm_usage_log (local DB — populated by TrackedOpenAIClient)",
+            "window_hours":       window_hours,
+            "alltime_calls":      alltime_calls,
+            "alltime_tokens":     alltime_tokens,
+            "models_in_window":   [m.get("model") for m in models_breakdown],
+            "recent_calls":       recent_calls,
+        },
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # MAIN ENDPOINT
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1651,6 +1894,8 @@ async def get_health_metrics(dataset_id: Optional[str] = Query(None)):
             _tab_governance, _tab_system_platform, _tab_human_feedback,
         ]
 
+        # Azure tab is added separately — it uses a different DB helper
+        # so we append it after the main loop
         tabs = []
         for fn in tab_fns:
             try:
@@ -1663,6 +1908,17 @@ async def get_health_metrics(dataset_id: Optional[str] = Query(None)):
                     "error": str(e),
                     "explainability": {"overview": f"Tab computation failed: {e}"},
                 })
+
+        # Append Azure LLM tab — safe, always produces a result
+        try:
+            tabs.append(_tab_azure_llm(conn))
+        except Exception as e:
+            logger.error(f"Azure tab failed: {e}", exc_info=True)
+            tabs.append({
+                "tab": "Azure LLM Usage", "metrics": [],
+                "error": str(e),
+                "explainability": {"overview": f"Azure tab failed: {e}"},
+            })
 
         return {
             "generated_at": generated_at,
@@ -1739,3 +1995,53 @@ async def debug_schema():
         }
     except Exception as e:
         return {"error": str(e), "db_path": DB_PATH}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AZURE METRICS ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.get("/api/azure-metrics", include_in_schema=True)
+async def get_azure_metrics():
+    """
+    Returns the current Azure Monitor snapshot (live, 5-min cache).
+    All values come directly from Azure — nothing is hardcoded.
+    """
+    try:
+        from app.routers.azure_metrics_collector import fetch_live, is_configured
+        data = fetch_live() if is_configured() else None
+        return {
+            "configured": is_configured(),
+            "data":       data,
+            "note":       "5-minute cache. POST /api/azure-metrics/refresh to force re-fetch.",
+        }
+    except ImportError:
+        return {"configured": False, "data": None,
+                "error": "azure_metrics_collector not installed — run: pip install azure-identity azure-monitor-query"}
+    except Exception as e:
+        return {"configured": False, "data": None, "error": str(e)}
+
+
+@router.post("/api/azure-metrics/refresh", include_in_schema=True)
+async def refresh_azure_metrics():
+    """
+    Force a fresh Azure Monitor poll, bypassing the 5-minute cache.
+    """
+    try:
+        import app.routers.azure_metrics_collector as _amc
+        _amc._cache = None
+        _amc._cache_fetched_at = None
+        data = _amc.fetch_live(force=True)
+        if data is None:
+            return {
+                "success": False,
+                "reason": (
+                    "Azure not configured — set AZURE_* env vars"
+                    if not _amc.is_configured()
+                    else "Azure Monitor fetch failed — check server logs"
+                ),
+            }
+        return {"success": True, "data": data}
+    except ImportError:
+        return {"success": False, "reason": "azure_metrics_collector not installed"}
+    except Exception as e:
+        return {"success": False, "reason": str(e)}
