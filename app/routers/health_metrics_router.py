@@ -810,14 +810,22 @@ def _tab_dq_scores(conn, s, dataset_id) -> dict:
 # TAB 4 — DQ RULES
 # ═══════════════════════════════════════════════════════════════════════════
 
+# UPDATED DQ RULES TAB
 def _tab_dq_rules(conn, s, dataset_id) -> dict:
     act_status  = s["rule_active_status"]
     source_col  = s["rule_source_col"]
     rr_rule_col = s["rr_rule_id_col"]
-    has_ds      = "dataset_id" in _columns(conn, "dq_rules")
+    dr_cols     = _columns(conn, "dq_rules")
+    has_ds      = "dataset_id" in dr_cols
+    rr_exists   = _table_exists(conn, "dq_rule_runs")
 
     ds_r = "AND dataset_id = ?" if (dataset_id and has_ds) else ""
     r_p  = [dataset_id] if ds_r else []
+
+    total_datasets = _scalar(conn, "SELECT COUNT(*) FROM datasets", default=0) or 0
+    # Coverage-style metrics are measured against the scope being viewed:
+    # the single dataset when one is selected, otherwise the whole fleet.
+    scope_total = 1 if dataset_id else total_datasets
 
     act_expr = f"COUNT(CASE WHEN status = '{act_status}' THEN 1 END)" if act_status else "COUNT(NULL)"
 
@@ -827,79 +835,133 @@ def _tab_dq_rules(conn, s, dataset_id) -> dict:
     total_rules  = row_rules["total"]  if row_rules else 0
 
     # ── rule_execution_success_rate ───────────────────────────────────────────
+    # Active rules (in scope) that have AT LEAST ONE recorded run in
+    # dq_rule_runs. Joined on dq_rules.id so runs belonging to another
+    # dataset's rules can never leak into this dataset's count — the
+    # previous version counted ALL distinct rule_ids ever run, globally.
     executed = 0
-    if rr_rule_col:
-        row_exec = _one(conn, f"SELECT COUNT(DISTINCT {rr_rule_col}) as ex FROM dq_rule_runs")
+    if rr_rule_col and rr_exists:
+        join_status = "AND r.status = ?" if act_status else ""
+        join_ds     = "AND r.dataset_id = ?" if (dataset_id and has_ds) else ""
+        join_p = ([act_status] if join_status else []) + ([dataset_id] if join_ds else [])
+        row_exec = _one(conn,
+            f"SELECT COUNT(DISTINCT rr.{rr_rule_col}) as ex "
+            f"FROM dq_rule_runs rr "
+            f"JOIN dq_rules r ON rr.{rr_rule_col} = r.id "
+            f"WHERE 1=1 {join_status} {join_ds}", join_p)
         executed = row_exec["ex"] if row_exec else 0
+
+    # Run-level detail: real pass-rate across executions, when dq_rule_runs
+    # exposes aggregate pass/total counts per run (same columns the DQ
+    # Scores tab falls back to).
+    rr_cols  = _columns(conn, "dq_rule_runs") if rr_exists else set()
+    pass_col = _find_col(rr_cols, ["passed_count", "passed", "pass_count"])
+    tot_col  = _find_col(rr_cols, ["total_count", "row_count", "evaluated_count", "total"])
+    avg_run_pass_rate = None
+    if rr_rule_col and pass_col and tot_col and rr_exists:
+        join_ds2 = "AND r.dataset_id = ?" if (dataset_id and has_ds) else ""
+        p2 = [dataset_id] if join_ds2 else []
+        row_runs = _one(conn,
+            f"SELECT COALESCE(SUM(rr.{pass_col}),0) as p, COALESCE(SUM(rr.{tot_col}),0) as t "
+            f"FROM dq_rule_runs rr JOIN dq_rules r ON rr.{rr_rule_col} = r.id "
+            f"WHERE 1=1 {join_ds2}", p2)
+        if row_runs and row_runs["t"]:
+            avg_run_pass_rate = safe_pct(row_runs["p"], row_runs["t"])
+
     resr_val    = safe_pct(executed, active_rules)
     resr_status = _status(resr_val, healthy_ge=80, critical_lt=30)
 
     # ── rule_recommendation_acceptance_rate ───────────────────────────────────
-    ai_sources = s["policy_source_values"] or {"llm", "ai", "gpt", "openai", "generated"}
+    # AI-origin values must be discovered from dq_rules.source ITSELF.
+    # The previous version borrowed "policy_source_values" — the distinct
+    # `source` values from the governance_policies table — which has
+    # nothing to do with DQ rule provenance and silently broke this metric.
+    ai_sources = set()
+    if source_col:
+        rows = _all(conn,
+            f"SELECT DISTINCT {source_col} as v FROM dq_rules WHERE {source_col} IS NOT NULL")
+        ai_keywords = ("ai", "llm", "gpt", "auto", "recommend", "generated", "model", "suggested")
+        ai_sources = {r["v"] for r in rows if r["v"] and any(k in str(r["v"]).lower() for k in ai_keywords)}
     in_cl = ", ".join(f"'{v}'" for v in ai_sources)
 
-    if source_col and act_status:
-        row_ai = _one(conn,
-            f"SELECT {act_expr} as accepted, COUNT(*) as suggested "
-            f"FROM dq_rules WHERE {source_col} IN ({in_cl}) {ds_r}", r_p)
-        ai_accepted  = row_ai["accepted"]  if row_ai else 0
-        ai_suggested = row_ai["suggested"] if row_ai else 0
-    else:
-        ai_accepted, ai_suggested = 0, 0
-    rrar_val    = safe_pct(ai_accepted, ai_suggested)
-    rrar_status = _status(rrar_val, healthy_ge=70, critical_lt=20)
+    ai_suggested = 0
+    if source_col and ai_sources:
+        row_sugg = _one(conn,
+            f"SELECT COUNT(*) as cnt FROM dq_rules WHERE {source_col} IN ({in_cl}) {ds_r}", r_p)
+        ai_suggested = row_sugg["cnt"] if row_sugg else 0
+
+    ai_accepted = 0
+    if source_col and ai_sources and act_status:
+        row_acc = _one(conn,
+            f"SELECT COUNT(*) as cnt FROM dq_rules WHERE {source_col} IN ({in_cl}) "
+            f"AND status = ? {ds_r}", [act_status] + r_p)
+        ai_accepted = row_acc["cnt"] if row_acc else 0
+
+    rrar_val    = safe_pct(ai_accepted, ai_suggested) if (act_status and ai_suggested) else None
+    rrar_status = _status(rrar_val, healthy_ge=70, critical_lt=20) if rrar_val is not None else "neutral"
 
     # ── hallucinated_rule_rate ────────────────────────────────────────────────
     never_run = 0
-    if source_col and ai_suggested > 0 and rr_rule_col:
+    if source_col and ai_sources and ai_suggested and rr_rule_col:
+        ds_alias = "AND r.dataset_id = ?" if (dataset_id and has_ds) else ""
         row_nv = _one(conn,
             f"SELECT COUNT(*) as nv FROM dq_rules r "
             f"WHERE r.{source_col} IN ({in_cl}) "
-            f"AND NOT EXISTS (SELECT 1 FROM dq_rule_runs rr WHERE rr.{rr_rule_col}=r.id) {ds_r}", r_p)
+            f"AND NOT EXISTS (SELECT 1 FROM dq_rule_runs rr WHERE rr.{rr_rule_col} = r.id) {ds_alias}",
+            r_p)
         never_run = row_nv["nv"] if row_nv else 0
-    hrr_val    = safe_pct(never_run, ai_suggested)
+    hrr_val    = safe_pct(never_run, ai_suggested) if ai_suggested else None
     hrr_status = _status(hrr_val, healthy_le=10, critical_gt=50) if hrr_val is not None else "neutral"
 
     # ── rule_coverage_rate ────────────────────────────────────────────────────
-    total_datasets = _scalar(conn, "SELECT COUNT(*) FROM datasets", default=0)
+    covered = 0
     if act_status:
         row_cov = _one(conn,
             f"SELECT COUNT(DISTINCT dataset_id) as covered FROM dq_rules "
             f"WHERE status = ? {ds_r}", [act_status] + r_p)
         covered = row_cov["covered"] if row_cov else 0
-    else:
-        covered = 0
-    rcr_val    = safe_pct(covered, total_datasets)
-    rcr_status = _status(rcr_val, healthy_ge=80, critical_lt=30)
+    rcr_val    = safe_pct(covered, scope_total) if scope_total else None
+    rcr_status = _status(rcr_val, healthy_ge=80, critical_lt=30) if rcr_val is not None else "neutral"
 
     return {
         "tab": "DQ Rules",
         "metrics": [
             M("rule_execution_success_rate", "Rule Execution Rate",
               resr_val, "%", resr_status,
-              "active_rules_with_at_least_one_run / active_rules × 100",
+              "active_rules_in_scope_with_>=1_run_in_dq_rule_runs / active_rules_in_scope × 100",
               {"executed": executed, "active": active_rules, "total": total_rules,
-               "active_status_used": act_status}),
+               "active_status_used": act_status, "rule_run_fk_col": rr_rule_col or "not found",
+               "avg_run_pass_rate": avg_run_pass_rate}),
 
             M("rule_recommendation_acceptance_rate", "AI Rule Acceptance Rate",
               rrar_val, "%", rrar_status,
-              "active_ai_suggested_rules / total_ai_suggested_rules × 100",
+              f"dq_rules.{source_col or 'source'}_is_ai_origin_AND_status_active / ai_origin_total × 100",
               {"accepted": ai_accepted, "suggested": ai_suggested,
-               "source_values_checked": list(ai_sources)}),
+               "source_col_used": source_col or "not found",
+               "ai_source_values_detected": sorted(ai_sources)}),
 
             M("hallucinated_rule_rate", "Hallucinated Rule Rate",
               hrr_val, "%", hrr_status,
-              "ai_rules_never_executed / total_ai_rules × 100",
+              "ai_origin_rules_never_executed_in_dq_rule_runs / ai_origin_rules_total × 100",
               {"never_run": never_run, "ai_rules": ai_suggested}),
 
             M("rule_coverage_rate", "Dataset Rule Coverage",
               rcr_val, "%", rcr_status,
-              "datasets_with_active_rules / total_datasets × 100",
-              {"covered": covered, "total_datasets": total_datasets}),
+              "datasets_in_scope_with_>=1_active_rule / datasets_in_scope × 100",
+              {"covered": covered, "datasets_in_scope": scope_total,
+               "scoped_to_dataset": bool(dataset_id)}),
         ],
         "explainability": {
-            "overview": "DQ Rules tracks rule execution and dataset coverage.",
-            "improvement": "Run rules in DQ Engine tab to populate dq_rule_runs.",
+            "overview": (
+                f"DQ Rules tracks {total_rules} rule(s) ({active_rules} active) against real "
+                f"execution history in dq_rule_runs. AI-origin rules are detected from "
+                f"dq_rules.{source_col or 'source'} directly, not borrowed from an unrelated table."
+            ),
+            "improvement": (
+                "Run rules from the DQ Engine tab to populate dq_rule_runs — rule_execution_success_rate "
+                "and avg_run_pass_rate stay at 0 until then. A high hallucinated_rule_rate means "
+                "AI-suggested rules are being approved but never actually executed against real data."
+            ),
         },
     }
 
@@ -1110,65 +1172,122 @@ def _tab_anomalies_ai(conn, s, dataset_id) -> dict:
 # TAB 7 — DATA LINEAGE & IMPACT
 # ═══════════════════════════════════════════════════════════════════════════
 
+# UPDATED DATA LINEAGE TAB
 def _tab_data_lineage(conn, s, dataset_id) -> dict:
     pr_comp = s["pr_completed_status"]
     has_ds  = s["pr_has_dataset_id"]
 
-    le_cols    = _columns(conn, "lineage_edges")
-    id_col     = _find_col(le_cols, ["source_dataset_id", "dataset_id", "from_dataset_id"])
+    le_exists = _table_exists(conn, "lineage_edges")
+    le_cols   = _columns(conn, "lineage_edges") if le_exists else set()
+
+    src_col    = _find_col(le_cols, ["source_dataset_id", "dataset_id", "from_dataset_id"])
+    # FIX: target column was previously hardcoded as "target_dataset_id" instead
+    # of being discovered like every other column — broke silently on any
+    # schema using e.g. "to_dataset_id".
+    tgt_col    = _find_col(le_cols, ["target_dataset_id", "to_dataset_id", "destination_dataset_id"])
     conf_col   = _find_col(le_cols, ["confidence", "weight", "score"])
     status_col = _find_col(le_cols, ["status", "edge_status", "state"])
 
-    total_datasets = _scalar(conn, "SELECT COUNT(*) FROM datasets", default=0)
+    total_datasets = _scalar(conn, "SELECT COUNT(*) FROM datasets", default=0) or 0
+    # Coverage-style metrics are measured against the scope being viewed:
+    # the single dataset when one is selected, otherwise the whole fleet.
+    scope_total = 1 if dataset_id else total_datasets
 
-    ds_le: str = ""
-    le_p:  list = []
-    if dataset_id and id_col:
-        ds_le = f"AND ({id_col} = ? OR target_dataset_id = ?)"
+    ds_le, le_p = "", []
+    if dataset_id and src_col and tgt_col:
+        ds_le = f"AND ({src_col} = ? OR {tgt_col} = ?)"
         le_p  = [dataset_id, dataset_id]
+    elif dataset_id and src_col:
+        ds_le = f"AND {src_col} = ?"
+        le_p  = [dataset_id]
+    elif dataset_id and tgt_col:
+        ds_le = f"AND {tgt_col} = ?"
+        le_p  = [dataset_id]
+
+    edges = 0
+    if le_exists:
+        row_e = _one(conn, f"SELECT COUNT(*) as cnt FROM lineage_edges WHERE 1=1 {ds_le}", le_p)
+        edges = row_e["cnt"] if row_e else 0
 
     # ── lineage_coverage ──────────────────────────────────────────────────────
-    if id_col and _table_exists(conn, "lineage_edges"):
-        row_lc = _one(conn,
-            f"SELECT COUNT(DISTINCT {id_col}) as mapped, COUNT(*) as edges "
-            f"FROM lineage_edges WHERE 1=1 {ds_le}", le_p)
-        mapped = row_lc["mapped"] if row_lc else 0
-        edges  = row_lc["edges"]  if row_lc else 0
-    else:
-        mapped, edges = 0, 0
-    lc_val    = safe_pct(mapped, total_datasets)
+    # FIX: previously counted DISTINCT on the source column only, so a
+    # dataset that only ever appears as a *target* was invisible to the
+    # global coverage figure. Now unions both sides.
+    mapped = 0
+    if le_exists and (src_col or tgt_col):
+        if dataset_id:
+            # Scoped view: is THIS dataset connected to the lineage graph at all?
+            mapped = 1 if edges > 0 else 0
+        elif src_col and tgt_col:
+            row_lc = _one(conn,
+                f"SELECT COUNT(DISTINCT d) as mapped FROM ("
+                f"SELECT {src_col} as d FROM lineage_edges UNION "
+                f"SELECT {tgt_col} as d FROM lineage_edges) t WHERE d IS NOT NULL")
+            mapped = row_lc["mapped"] if row_lc else 0
+        else:
+            only_col = src_col or tgt_col
+            row_lc = _one(conn,
+                f"SELECT COUNT(DISTINCT {only_col}) as mapped FROM lineage_edges "
+                f"WHERE {only_col} IS NOT NULL")
+            mapped = row_lc["mapped"] if row_lc else 0
+    lc_val    = safe_pct(mapped, scope_total) if scope_total else None
     lc_status = "neutral" if edges == 0 else _status(lc_val, healthy_ge=80, critical_lt=20)
 
     # ── broken_edge_count ─────────────────────────────────────────────────────
-    broken = 0
-    if status_col and _table_exists(conn, "lineage_edges"):
+    # Two independent, real signals instead of one fragile status check:
+    #   1. an explicit status flag saying the edge is broken/invalid/stale
+    #   2. referential integrity — the edge points at a dataset_id that no
+    #      longer exists in `datasets` (orphaned by a deletion)
+    flagged_broken, orphaned = 0, 0
+    if le_exists and status_col and edges:
         row_be = _one(conn,
-            f"SELECT COUNT(CASE WHEN LOWER({status_col})='broken' THEN 1 END) as broken "
+            f"SELECT COUNT(CASE WHEN LOWER({status_col}) IN "
+            f"('broken','invalid','failed','stale','error') THEN 1 END) as broken "
             f"FROM lineage_edges WHERE 1=1 {ds_le}", le_p)
-        broken = row_be["broken"] if row_be else 0
-    bec_status = "healthy" if broken == 0 else "critical"
+        flagged_broken = row_be["broken"] if row_be else 0
+    if le_exists and edges and (src_col or tgt_col):
+        conds = []
+        if src_col:
+            conds.append(f"({src_col} IS NOT NULL AND {src_col} NOT IN (SELECT id FROM datasets))")
+        if tgt_col:
+            conds.append(f"({tgt_col} IS NOT NULL AND {tgt_col} NOT IN (SELECT id FROM datasets))")
+        orphan_expr = " OR ".join(conds)
+        row_orph = _one(conn,
+            f"SELECT COUNT(CASE WHEN {orphan_expr} THEN 1 END) as orphaned "
+            f"FROM lineage_edges WHERE 1=1 {ds_le}", le_p)
+        orphaned = row_orph["orphaned"] if row_orph else 0
+    broken = flagged_broken + orphaned
 
-    # ── missed_dependency_rate ────────────────────────────────────────────────
-    low_conf, md_total = 0, edges
-    if conf_col and edges:
+    if not le_exists or edges == 0:
+        bec_status = "neutral"
+    elif not status_col and not src_col and not tgt_col:
+        bec_status = "neutral"   # no signal of any kind available — don't fake "healthy"
+    else:
+        bec_status = "healthy" if broken == 0 else "critical"
+
+    # ── missed_dependency_rate (low-confidence dependencies) ──────────────────
+    low_conf = 0
+    if le_exists and conf_col and edges:
         row_md = _one(conn,
             f"SELECT COUNT(CASE WHEN {conf_col} < 0.5 THEN 1 END) as low_conf "
             f"FROM lineage_edges WHERE 1=1 {ds_le}", le_p)
         low_conf = row_md["low_conf"] if row_md else 0
-    mdr_val    = safe_pct(low_conf, md_total)
-    mdr_status = _status(mdr_val, healthy_le=20, critical_gt=60)
+    mdr_val    = safe_pct(low_conf, edges) if (conf_col and edges) else None
+    mdr_status = _status(mdr_val, healthy_le=20, critical_gt=60) if mdr_val is not None else "neutral"
 
     # ── datasets_profiled_rate ────────────────────────────────────────────────
+    ds_pr = "AND dataset_id = ?" if (dataset_id and has_ds) else ""
+    pr_p  = [dataset_id] if ds_pr else []
     if pr_comp:
-        ds_pr = "AND dataset_id = ?" if (dataset_id and has_ds) else ""
         row_prof = _one(conn,
             f"SELECT COUNT(DISTINCT dataset_id) as profiled FROM profiling_runs "
-            f"WHERE status = ? {ds_pr}", [pr_comp] + ([dataset_id] if ds_pr else []))
-        profiled = row_prof["profiled"] if row_prof else 0
+            f"WHERE status = ? {ds_pr}", [pr_comp] + pr_p)
     else:
-        row_prof = _one(conn, "SELECT COUNT(DISTINCT dataset_id) as profiled FROM profiling_runs")
-        profiled = row_prof["profiled"] if row_prof else 0
-    dpr_val    = safe_pct(profiled, total_datasets)
+        row_prof = _one(conn,
+            f"SELECT COUNT(DISTINCT dataset_id) as profiled FROM profiling_runs WHERE 1=1 {ds_pr}",
+            pr_p)
+    profiled = row_prof["profiled"] if row_prof else 0
+    dpr_val    = safe_pct(profiled, scope_total) if scope_total else None
     dpr_status = _status(dpr_val, healthy_ge=80, critical_lt=30)
 
     return {
@@ -1176,27 +1295,41 @@ def _tab_data_lineage(conn, s, dataset_id) -> dict:
         "metrics": [
             M("lineage_coverage", "Lineage Coverage",
               lc_val, "%", lc_status,
-              "datasets_with_lineage_edges / total_datasets × 100",
-              {"mapped": mapped, "total": total_datasets, "edges": edges}),
+              "distinct_datasets_in_lineage_edges(source ∪ target) / datasets_in_scope × 100",
+              {"mapped": mapped, "datasets_in_scope": scope_total, "edges": edges,
+               "scoped_to_dataset": bool(dataset_id),
+               "source_col_used": src_col or "not found",
+               "target_col_used": tgt_col or "not found"}),
 
             M("broken_edge_count", "Broken Lineage Edges",
               broken, "", bec_status,
-              "COUNT(lineage_edges WHERE LOWER(status)='broken')",
-              {"broken": broken, "total": edges}),
+              "edges_flagged_broken_by_status + edges_referencing_a_deleted_dataset",
+              {"flagged_broken": flagged_broken, "orphaned_references": orphaned,
+               "total": edges, "status_col_used": status_col or "not found"}),
 
             M("missed_dependency_rate", "Low-Confidence Dependency Rate",
               mdr_val, "%", mdr_status,
-              "edges_with_confidence < 0.5 / total × 100",
-              {"low_confidence": low_conf, "total": md_total}),
+              f"edges_with_{conf_col or 'confidence'}<0.5 / total_edges × 100",
+              {"low_confidence": low_conf, "total": edges,
+               "confidence_col_used": conf_col or "not found"}),
 
             M("datasets_profiled_rate", "Datasets Profiled",
               dpr_val, "%", dpr_status,
-              "datasets_with_completed_profiling_run / total_datasets × 100",
-              {"profiled": profiled, "total_datasets": total_datasets}),
+              "datasets_in_scope_with_completed_profiling_run / datasets_in_scope × 100",
+              {"profiled": profiled, "datasets_in_scope": scope_total,
+               "scoped_to_dataset": bool(dataset_id)}),
         ],
         "explainability": {
-            "overview": "Lineage tracks dataset relationships. 0 edges = lineage engine not triggered yet.",
-            "improvement": "Run full profiling on all datasets to generate lineage edges automatically.",
+            "overview": (
+                f"Lineage tracks dataset-to-dataset relationships from lineage_edges. "
+                f"{edges} edge(s) found" + (f" for dataset {dataset_id}" if dataset_id else "") +
+                ". 0 edges means the lineage engine hasn't produced anything for this scope yet."
+            ),
+            "improvement": (
+                "Run full profiling on all datasets to generate lineage edges automatically, "
+                "or define manual edges in the Lineage tab. Orphaned references (edges pointing "
+                "at a deleted dataset) should be cleared by invalidating and re-syncing lineage."
+            ),
         },
     }
 
@@ -1205,65 +1338,158 @@ def _tab_data_lineage(conn, s, dataset_id) -> dict:
 # TAB 8 — KNOWLEDGE GRAPH AI
 # ═══════════════════════════════════════════════════════════════════════════
 
+# UPDATED KG TAB
 def _tab_knowledge_graph(conn, s, dataset_id) -> dict:
-    kg_cols  = _columns(conn, "knowledge_graph_edges")
-    conf_col = _find_col(kg_cols, ["confidence", "weight", "score"])
+    kg_exists = _table_exists(conn, "knowledge_graph_edges")
+    kg_cols   = _columns(conn, "knowledge_graph_edges") if kg_exists else set()
 
-    kg_total = _scalar(conn, "SELECT COUNT(*) FROM knowledge_graph_edges", default=0) \
-        if _table_exists(conn, "knowledge_graph_edges") else 0
+    conf_col   = _find_col(kg_cols, ["confidence", "weight", "score"])
+    src_col    = _find_col(kg_cols, ["source_dataset_id", "src_dataset_id", "from_dataset_id"])
+    tgt_col    = _find_col(kg_cols, ["target_dataset_id", "tgt_dataset_id", "to_dataset_id"])
+    # Edges get re-discovered on every rebuild; a soft-delete/invalidation
+    # flag is how stale duplicates are retired without losing history.
+    inv_col    = _find_col(kg_cols, ["invalidated", "is_invalidated", "deleted", "is_deleted", "removed"])
+    method_col = _find_col(kg_cols, ["method", "source", "origin", "created_by"])
+    date_col   = _find_populated_col(conn, "knowledge_graph_edges",
+        ["created_at", "updated_at", "timestamp", "detected_at"]) if kg_exists else None
 
-    # ── kg_build_status (replaces misleading kg_column_mapping_accuracy) ──────
-    qs_last = None
-    if kg_total > 0 and "created_at" in kg_cols:
-        row_last = _one(conn, "SELECT MAX(created_at) as last FROM knowledge_graph_edges")
-        qs_last = row_last["last"] if row_last else None
-    build_status_val = (
-        "Built"     if kg_total > 0
-        else "Not Built"
-    )
-    kg_build_status_health = "healthy" if kg_total > 0 else "neutral"
+    # "Active" = not soft-deleted by a later rebuild. If there's no such
+    # column, every persisted edge is considered active.
+    active_filter = f"({inv_col} = 0 OR {inv_col} IS NULL)" if inv_col else "1=1"
+
+    total_datasets = _scalar(conn, "SELECT COUNT(*) FROM datasets", default=0) or 0
+    # Coverage-style metrics are measured against the scope being viewed:
+    # the single dataset when one is selected, otherwise the whole fleet.
+    scope_total = 1 if dataset_id else total_datasets
+
+    # ── Dataset scope filter (matches either side of the edge) ───────────────
+    # FIX: the previous version never used `dataset_id` at all — every KG
+    # metric was silently global regardless of which dataset was selected.
+    ds_kg, kg_p = "", []
+    if dataset_id and src_col and tgt_col:
+        ds_kg = f"AND ({src_col} = ? OR {tgt_col} = ?)"
+        kg_p  = [dataset_id, dataset_id]
+    elif dataset_id and src_col:
+        ds_kg = f"AND {src_col} = ?"
+        kg_p  = [dataset_id]
+    elif dataset_id and tgt_col:
+        ds_kg = f"AND {tgt_col} = ?"
+        kg_p  = [dataset_id]
+
+    total_all, active_total, last_built = 0, 0, None
+    if kg_exists:
+        row_tot = _one(conn,
+            f"SELECT COUNT(*) as total, "
+            f"COUNT(CASE WHEN {active_filter} THEN 1 END) as active "
+            f"FROM knowledge_graph_edges WHERE 1=1 {ds_kg}", kg_p)
+        total_all    = row_tot["total"]  if row_tot else 0
+        active_total = row_tot["active"] if row_tot else 0
+
+        if date_col:
+            row_last = _one(conn,
+                f"SELECT MAX({date_col}) as last FROM knowledge_graph_edges "
+                f"WHERE {active_filter} {ds_kg}", kg_p)
+            last_built = row_last["last"] if row_last else None
+
+    # ── kg_build_status ───────────────────────────────────────────────────────
+    build_status_val       = "Built" if active_total > 0 else "Not Built"
+    kg_build_status_health = "healthy" if active_total > 0 else "neutral"
+
+    method_dist = {}
+    if kg_exists and method_col and active_total > 0:
+        rows = _all(conn,
+            f"SELECT {method_col} as m, COUNT(*) as cnt FROM knowledge_graph_edges "
+            f"WHERE {active_filter} {ds_kg} GROUP BY {method_col}", kg_p)
+        method_dist = {(r["m"] or "unknown"): r["cnt"] for r in rows}
 
     # ── kg_relationship_precision ─────────────────────────────────────────────
     high_conf = 0
-    if conf_col and kg_total > 0:
+    if kg_exists and conf_col and active_total > 0:
         row_p = _one(conn,
             f"SELECT COUNT(CASE WHEN {conf_col} >= 0.7 THEN 1 END) as hc "
-            f"FROM knowledge_graph_edges")
+            f"FROM knowledge_graph_edges WHERE {active_filter} {ds_kg}", kg_p)
         high_conf = row_p["hc"] if row_p else 0
-    rp_val    = safe_pct(high_conf, kg_total)
-    rp_status = _status(rp_val, healthy_ge=70, critical_lt=30)
+    rp_val    = safe_pct(high_conf, active_total) if active_total else None
+    rp_status = _status(rp_val, healthy_ge=70, critical_lt=30) if rp_val is not None else "neutral"
 
-    # ── kg_hallucinated_relationship_rate ─────────────────────────────────────
-    unscored = 0
-    if conf_col and kg_total > 0:
-        row_u = _one(conn,
-            f"SELECT COUNT(CASE WHEN {conf_col} IS NULL THEN 1 END) as us "
-            f"FROM knowledge_graph_edges")
-        unscored = row_u["us"] if row_u else 0
-    kghrr_val    = safe_pct(unscored, kg_total)
-    kghrr_status = _status(kghrr_val, healthy_le=10, critical_gt=50)
+    # ── kg_low_quality_edge_rate ──────────────────────────────────────────────
+    # Replaces the old "hallucinated/unscored" metric (NULL-confidence only)
+    # with a broader, more honest definition: never scored OR scored but weak.
+    low_quality = 0
+    if kg_exists and conf_col and active_total > 0:
+        row_lq = _one(conn,
+            f"SELECT COUNT(CASE WHEN {conf_col} IS NULL OR {conf_col} < 0.3 THEN 1 END) as lq "
+            f"FROM knowledge_graph_edges WHERE {active_filter} {ds_kg}", kg_p)
+        low_quality = row_lq["lq"] if row_lq else 0
+    lqer_val    = safe_pct(low_quality, active_total) if (conf_col and active_total) else None
+    lqer_status = _status(lqer_val, healthy_le=10, critical_gt=40) if lqer_val is not None else "neutral"
+
+    # ── kg_entity_coverage ─────────────────────────────────────────────────────
+    # NEW metric: what fraction of datasets actually participate in the
+    # knowledge graph (as either side of an active edge)?
+    covered = 0
+    if kg_exists and active_total > 0 and (src_col or tgt_col):
+        if dataset_id:
+            # Scoped view: is THIS dataset connected to the graph at all?
+            covered = 1
+        elif src_col and tgt_col:
+            row_ec = _one(conn,
+                f"SELECT COUNT(DISTINCT d) as covered FROM ("
+                f"SELECT {src_col} as d FROM knowledge_graph_edges WHERE {active_filter} UNION "
+                f"SELECT {tgt_col} as d FROM knowledge_graph_edges WHERE {active_filter}"
+                f") t WHERE d IS NOT NULL")
+            covered = row_ec["covered"] if row_ec else 0
+        else:
+            only_col = src_col or tgt_col
+            row_ec = _one(conn,
+                f"SELECT COUNT(DISTINCT {only_col}) as covered FROM knowledge_graph_edges "
+                f"WHERE {active_filter} AND {only_col} IS NOT NULL")
+            covered = row_ec["covered"] if row_ec else 0
+    ec_val    = safe_pct(covered, scope_total) if scope_total else None
+    ec_status = _status(ec_val, healthy_ge=50, critical_lt=10) if ec_val is not None else "neutral"
 
     return {
         "tab": "Knowledge Graph AI",
         "metrics": [
             M("kg_build_status", "Knowledge Graph Status",
               build_status_val, "", kg_build_status_health,
-              "categorical: Not Built / Built based on knowledge_graph_edges row count",
-              {"total_edges": kg_total, "last_built": qs_last}),
+              "categorical: Built when ≥1 active (non-invalidated) edge exists in knowledge_graph_edges",
+              {"active_edges": active_total, "total_edges_incl_invalidated": total_all,
+               "invalidated_col_used": inv_col or "not found",
+               "last_built": last_built, "build_method_distribution": method_dist}),
 
             M("kg_relationship_precision", "Relationship Precision",
               rp_val, "%", rp_status,
-              "KG_edges_with_confidence >= 0.7 / total × 100",
-              {"high_confidence": high_conf, "total": kg_total}),
+              f"active_edges_with_{conf_col or 'confidence'}>=0.7 / active_edges × 100",
+              {"high_confidence": high_conf, "active_edges": active_total,
+               "confidence_col_used": conf_col or "not found"}),
 
-            M("kg_hallucinated_relationship_rate", "Unscored Relationship Rate",
-              kghrr_val, "%", kghrr_status,
-              "edges_with_null_confidence / total × 100",
-              {"unscored": unscored, "total": kg_total}),
+            M("kg_low_quality_edge_rate", "Low-Quality Edge Rate",
+              lqer_val, "%", lqer_status,
+              f"active_edges_with_null_or_<0.3_{conf_col or 'confidence'} / active_edges × 100",
+              {"low_quality": low_quality, "active_edges": active_total,
+               "confidence_col_used": conf_col or "not found"}),
+
+            M("kg_entity_coverage", "Entity (Dataset) Coverage",
+              ec_val, "%", ec_status,
+              "distinct_datasets_in_active_edges(source ∪ target) / datasets_in_scope × 100",
+              {"datasets_covered": covered, "datasets_in_scope": scope_total,
+               "scoped_to_dataset": bool(dataset_id),
+               "source_col_used": src_col or "not found",
+               "target_col_used": tgt_col or "not found"}),
         ],
         "explainability": {
-            "overview": "KG metrics use knowledge_graph_edges. 0 edges = KG never been built.",
-            "improvement": "Use the Knowledge Graph tab in the main app to build the graph.",
+            "overview": (
+                "Knowledge Graph metrics read knowledge_graph_edges, excluding invalidated/"
+                f"superseded edges so rebuilds don't inflate counts. {active_total} active "
+                f"edge(s) found" + (f" for dataset {dataset_id}" if dataset_id else "") + "."
+            ),
+            "improvement": (
+                "0 active edges means the graph has never been built, or every edge was "
+                "invalidated by a later rebuild — use the Knowledge Graph tab in the main app "
+                "to (re)build it. A high low-quality-edge-rate means the relationship/matching "
+                "agents are persisting edges without enough confidence to be useful."
+            ),
         },
     }
 
