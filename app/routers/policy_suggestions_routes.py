@@ -45,7 +45,7 @@ _MODEL    = os.getenv("AZURE_OPENAI_MODEL", "Llama-3.3-70B-Instruct")
 
 _VERSION  = os.getenv("AZURE_OPENAI_API_VERSION", "2024-05-01-preview")
 
-from app.services.llm_tracker import track_llm_call
+from app.services.llm_tracker import track_llm_call, status_code_suffix
  
  
 def _llm(prompt: str, max_tokens: int = 1500) -> Optional[str]:
@@ -105,7 +105,7 @@ def _llm(prompt: str, max_tokens: int = 1500) -> Optional[str]:
         track_llm_call(
             feature="policy", model=_MODEL,
             latency_ms=(_time.time() - _t0) * 1000,
-            success=False, error_type=type(e).__name__, input_length=len(prompt),
+            success=False, error_type=status_code_suffix(e), input_length=len(prompt),
         )
 
         logger.error(f"[policy_suggestions] LLM error: {e}")

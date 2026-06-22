@@ -108,6 +108,28 @@ def track_llm_call(
     ).start()
 
 
+def status_code_suffix(exception: Exception) -> str:
+    """
+    Enrich a generic exception class name with its HTTP status code when
+    available, so the dashboard's error breakdown shows "HTTPError_404"
+    instead of just "HTTPError" — makes auth/URL misconfigurations
+    immediately visible without digging through Render logs.
+    """
+    name = type(exception).__name__
+    # requests.exceptions.HTTPError → exception.response.status_code
+    resp = getattr(exception, "response", None)
+    if resp is not None:
+        code = getattr(resp, "status_code", None)
+        if code:
+            return f"{name}_{code}"
+    # httpx.HTTPStatusError → exception.response.status_code (same shape)
+    # openai SDK errors → exception.status_code directly
+    code = getattr(exception, "status_code", None)
+    if code:
+        return f"{name}_{code}"
+    return name
+
+
 def track_error(
     feature:      str,
     model:        str   = "Llama-3.3-70B-Instruct",
@@ -159,32 +181,42 @@ def _send_to_langfuse(
     feature, model, prompt, response,
     pt, ct, tt, latency_ms, success, error_type, metadata,
 ) -> None:
+    """
+    Langfuse SDK v4 API.
+    v2/v3's `lf.trace(...).generation(...)` was removed entirely in v4 —
+    the SDK now uses an OpenTelemetry-based observation model:
+    `start_observation(as_type="generation")` returns an object you
+    `.update()` with output/usage, then `.end()` to close it.
+    """
     try:
         lf = _get_langfuse()
         if not lf:
             return
-        trace = lf.trace(
+        gen = lf.start_observation(
             name=f"ai_dqm_{feature}",
-            metadata={"model": model, **(metadata or {})},
-        )
-        trace.generation(
-            name=f"{feature}_generation",
+            as_type="generation",
             model=model,
             model_parameters={"source": "azure_ai_foundry"},
             input=prompt[:3000] if prompt else "",
+            metadata={"feature": feature, **(metadata or {})},
+        )
+        gen.update(
             output=response[:3000] if response else "",
-            usage={
+            usage_details={
                 "input":  pt or 0,
                 "output": ct or 0,
                 "total":  tt or 0,
             },
+            level="DEFAULT" if success else "ERROR",
+            status_message=error_type if not success else None,
             metadata={
-                "latency_ms":  latency_ms,
-                "success":     success,
-                "error_type":  error_type,
+                "latency_ms": latency_ms,
+                "success":    success,
+                "error_type": error_type,
                 **(metadata or {}),
             },
         )
+        gen.end()
         lf.flush()
     except Exception as e:
         print(f"[llm_tracker] Langfuse send failed (non-fatal): {e}")

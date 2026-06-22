@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional
 import time as _time
 import pandas as pd
 import requests as _http
-from app.services.llm_tracker import track_llm_call
+from app.services.llm_tracker import track_llm_call, status_code_suffix
 
 _KEY      = os.getenv("AZURE_OPENAI_API_KEY", "")
 _ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
@@ -40,6 +40,7 @@ def _llm(prompt: str, max_tokens: int = 1500) -> Optional[str]:
             url,
             headers={"Content-Type": "application/json", "api-key": _KEY},
             json={
+                "model": _MODEL,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.2,
                 "max_tokens": max_tokens,
@@ -73,7 +74,7 @@ def _llm(prompt: str, max_tokens: int = 1500) -> Optional[str]:
     except Exception as e:
         track_llm_call(feature="dq_rules", model=_MODEL,
             latency_ms=(_time.time() - _t0) * 1000, success=False,
-            error_type=type(e).__name__, input_length=len(prompt))
+            error_type=status_code_suffix(e), input_length=len(prompt))
         print(f"[ai_rule_generator] LLM error: {e}")
         return None
 

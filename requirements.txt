@@ -14,4 +14,4 @@ aiofiles
 psycopg2-binary
 databricks-sql-connector>=3.0.0
 httpx
-langfuse>=2.36.0
+langfuse>=4.0.0,<5.0.0
