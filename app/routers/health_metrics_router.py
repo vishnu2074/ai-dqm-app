@@ -890,6 +890,7 @@ def _tab_dq_rules(conn, s, dataset_id) -> dict:
     #
     # When input_mode col exists:  count WHERE input_mode='ai'
     # When only old source col:    count using keyword matching as before
+    ai_sources   = set()   # always initialised — referenced in the return block
     ai_suggested = 0
     ai_accepted  = 0
 
