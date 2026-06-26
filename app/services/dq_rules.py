@@ -598,8 +598,8 @@ def create_rule(
         raise ValueError("Dataset not found")
  
     mode = (input_mode or "").lower().strip()
-    if mode not in {"nl", "regex", "dsl"}:
-        raise ValueError("input_mode must be one of: nl, regex, dsl")
+    if mode not in {"nl", "regex", "dsl", "ai"}:
+        raise ValueError("input_mode must be one of: nl, regex, dsl, ai")
  
     if severity not in ALLOWED_SEVERITY:
         raise ValueError(f"severity must be one of: {', '.join(sorted(ALLOWED_SEVERITY))}")
@@ -629,7 +629,11 @@ def create_rule(
         condition = f'REGEX_MATCH({column}, "{pattern_escaped}")'
         inferred_type = "Validity"
  
-    elif mode == "dsl":
+    elif mode in ("dsl", "ai"):
+        # NOTE: "ai" mode behaves identically to "dsl" for condition parsing —
+        # the condition string is already fully formed by the AI rule generator.
+        # The distinction matters only for the input_mode column written to DB,
+        # which downstream health-metrics queries use to detect AI-origin rules.
         condition = (text or "").strip()
         if not condition:
             raise ValueError("Condition (DSL) is empty.")
@@ -709,6 +713,16 @@ def create_rule(
  
  
 def approve_ai_recommended_rule(db: Session, dataset_id: int, rule_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    FIXED: previously called create_rule(input_mode="dsl", ...) which overwrote
+    the rule's input_mode to "dsl" on approval. That meant the moment an AI rule
+    was approved, it became indistinguishable from a manually-written rule —
+    so health_metrics_router.py's AI-rule-acceptance-rate query (which filters
+    on dq_rules.input_mode == 'ai') always saw zero approved AI rules, even
+    though plenty were approved. Approved AI rules must keep input_mode="ai"
+    so they remain queryable as "AI-origin, currently Active" for the
+    rule_recommendation_acceptance_rate / hallucinated_rule_rate metrics.
+    """
     ds = db.query(Dataset).filter(Dataset.id == dataset_id).first()
     if not ds:
         raise ValueError("Dataset not found")
@@ -739,10 +753,11 @@ def approve_ai_recommended_rule(db: Session, dataset_id: int, rule_payload: Dict
         .all()
     )
  
+    # FIXED: input_mode="ai" (was "dsl") — preserves AI provenance after approval.
     created = create_rule(
         db,
         dataset_id,
-        input_mode="dsl",
+        input_mode="ai",
         text=condition,
         name=name,
         rule_type=rule_type,
@@ -901,6 +916,15 @@ def get_dataset_columns(db: Session, dataset_id: int) -> Dict[str, Any]:
  
  
 def get_ai_recommended_rules(db: Session, dataset_id: int):
+    """
+    FIXED: previously this function referenced `recommended_rules` inside the
+    notification block BEFORE the variable was ever assigned (it was only built
+    later in the function, in the loop below). That guaranteed a NameError on
+    every single call — meaning this endpoint has likely been crashing/raising
+    every time it's invoked. The notification-sending logic has been moved to
+    AFTER recommended_rules is fully built, where the data it references
+    actually exists.
+    """
     ds = db.query(Dataset).filter(Dataset.id == dataset_id).first()
  
     if not ds:
@@ -926,22 +950,6 @@ def get_ai_recommended_rules(db: Session, dataset_id: int):
     ).delete(synchronize_session=False)
  
     db.commit()
- 
-    try:
-        from app.routers.notification_inbox_routes import create_inbox_notification
- 
-        if recommended_rules:
-            create_inbox_notification(
-                title="AI Suggested New Rules",
-                message=f"{len(recommended_rules)} new AI rules generated for dataset",
-                category="ai",
-                severity="info",
-                link="/dq-rules",
-                dataset=str(dataset_id),
-            )
- 
-    except Exception:
-        pass
  
     try:
         ai_rules = generate_ai_rules(df)
@@ -1021,6 +1029,23 @@ def get_ai_recommended_rules(db: Session, dataset_id: int):
         })
  
     db.commit()
+ 
+    # NOTE: notification now sent AFTER recommended_rules is built and committed,
+    # using the real count. This was previously referenced before assignment.
+    try:
+        from app.routers.notification_inbox_routes import create_inbox_notification
+ 
+        if recommended_rules:
+            create_inbox_notification(
+                title="AI Suggested New Rules",
+                message=f"{len(recommended_rules)} new AI rules generated for dataset",
+                category="ai",
+                severity="info",
+                link="/dq-rules",
+                dataset=str(dataset_id),
+            )
+    except Exception:
+        pass
  
     return {
         "status": "success",

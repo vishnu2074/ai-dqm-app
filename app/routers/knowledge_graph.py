@@ -2,10 +2,32 @@
 python-backend/app/routers/knowledge_graph.py
 Knowledge Graph endpoints for automatic relationship discovery
 
-FIXED:
-  - service.build_graph(db, dataset_ids) — args were swapped
-  - KG edges now persisted to knowledge_graph_edges table after every build
-    so health metrics (kg_build_status, kg_relationship_precision) show real data
+FIXED (v2):
+  ROOT CAUSE OF "kg_build_status: Not Built": this router had its OWN
+  _persist_kg_edges() function that:
+    1. Wrote to a generic schema (source_node/from_node/source/etc.) that
+       doesn't match the REAL knowledge_graph_edges table — the real table
+       (defined in models/__init__.py as KnowledgeGraphEdge) has NOT NULL
+       INTEGER columns source_dataset_id / target_dataset_id, and this
+       function never wrote those at all — it wrote string dataset NAMES
+       into whatever text-like column it could find via introspection.
+    2. Ran a DELETE that wiped rows on every single build, including rows
+       that app/graph/kg_engine.py's _save_edges() had ALREADY correctly
+       written via the ORM (with proper INTEGER FKs) earlier in the same
+       request, since service.build_graph() internally calls detect_relationships()
+       which calls _save_edges().
+
+  In short: kg_engine.py already does this correctly through the ORM.
+  This router was redundantly (and incorrectly) re-persisting the same
+  data with a second, schema-mismatched code path, and clobbering the
+  correct rows in the process. The fix is to DELETE the duplicate
+  persistence logic entirely and trust kg_engine.py's service layer,
+  which is the only thing that actually understands the FK schema.
+
+  - service.build_graph(db, dataset_ids) — args were swapped (kept fixed)
+  - KG edges are now persisted ONLY by kg_engine.detect_relationships() /
+    _save_edges(), called internally by KnowledgeGraphService.build_graph().
+    This router no longer touches the table directly at all.
 """
 import os
 from datetime import datetime
@@ -28,124 +50,6 @@ def get_db():
         db.close()
 
 
-# ── KG Edge Persistence ───────────────────────────────────────────────────────
-
-def _persist_kg_edges(edges: list, folder: str = None) -> int:
-    """
-    Persist KG edges to knowledge_graph_edges table.
-    Schema-agnostic: introspects actual columns at runtime and maps
-    whatever fields the edge dicts contain to whatever columns exist.
-    Non-fatal — a persistence failure never breaks the API response.
-    """
-    if not edges:
-        return 0
-    saved = 0
-    try:
-        from app.database import engine
-        from sqlalchemy import text
-
-        with engine.connect() as conn:
-            # ── Discover actual table schema ──────────────────────────────────
-            cols_result = conn.execute(
-                text("PRAGMA table_info(knowledge_graph_edges)")
-            ).fetchall()
-            existing_cols = {row[1] for row in cols_result}
-            if not existing_cols:
-                print("[kg_persist] knowledge_graph_edges table not found — skipping")
-                return 0
-
-            # ── Clear previous auto-generated edges ───────────────────────────
-            if "folder" in existing_cols and folder:
-                conn.execute(
-                    text("DELETE FROM knowledge_graph_edges WHERE folder = :f"),
-                    {"f": folder}
-                )
-            elif folder:
-                # Table has no folder column — clear all non-user-defined edges
-                if "is_user_defined" in existing_cols:
-                    conn.execute(text(
-                        "DELETE FROM knowledge_graph_edges WHERE COALESCE(is_user_defined,0) = 0"
-                    ))
-                else:
-                    conn.execute(text("DELETE FROM knowledge_graph_edges"))
-            else:
-                # Dataset-IDs mode: clear old dataset-mode edges
-                if "is_user_defined" in existing_cols:
-                    conn.execute(text(
-                        "DELETE FROM knowledge_graph_edges WHERE COALESCE(is_user_defined,0) = 0"
-                    ))
-                else:
-                    conn.execute(text("DELETE FROM knowledge_graph_edges"))
-
-            now = datetime.utcnow().isoformat()
-
-            for edge in edges:
-                # ── Map edge fields → possible column names in priority order ──
-                edge_confidence = (
-                    edge.get("confidence") or edge.get("weight") or
-                    edge.get("score") or 0.8
-                )
-                edge_source = edge.get("source") or edge.get("from", "")
-                edge_target = edge.get("target") or edge.get("to", "")
-                edge_type   = (
-                    edge.get("relationship_type") or edge.get("type") or
-                    edge.get("edge_type") or "related"
-                )
-
-                field_map = {
-                    # Column name variants for source
-                    "source_node":    edge_source,
-                    "source":         edge_source,
-                    "source_dataset": edge_source,
-                    "from_node":      edge_source,
-                    # Column name variants for target
-                    "target_node":    edge_target,
-                    "target":         edge_target,
-                    "target_dataset": edge_target,
-                    "to_node":        edge_target,
-                    # Relationship / type
-                    "relationship_type": edge_type,
-                    "edge_type":         edge_type,
-                    "type":              edge_type,
-                    "relation":          edge_type,
-                    # Confidence / weight
-                    "confidence": edge_confidence,
-                    "weight":     edge_confidence,
-                    "score":      edge_confidence,
-                    # Metadata
-                    "created_at": now,
-                    "folder":     folder,
-                    "dataset_id": edge.get("dataset_id"),
-                }
-
-                # Only include columns that actually exist in the table
-                row = {
-                    col: val for col, val in field_map.items()
-                    if col in existing_cols and val is not None
-                }
-                if not row:
-                    continue
-
-                cols_str = ", ".join(row.keys())
-                vals_str = ", ".join(f":{k}" for k in row.keys())
-                try:
-                    conn.execute(
-                        text(f"INSERT INTO knowledge_graph_edges ({cols_str}) VALUES ({vals_str})"),
-                        row
-                    )
-                    saved += 1
-                except Exception as insert_err:
-                    # Single edge failure is non-fatal
-                    pass
-
-            conn.commit()
-            print(f"[kg_persist] Saved {saved}/{len(edges)} edges to knowledge_graph_edges")
-
-    except Exception as e:
-        print(f"[kg_persist] Persistence failed (non-fatal): {e}")
-    return saved
-
-
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.post("/knowledge-graph")
@@ -153,17 +57,18 @@ def get_knowledge_graph(
     dataset_ids: List[int] = Body(...),
     db: Session = Depends(get_db),
 ):
-    """Build knowledge graph for specified datasets and persist edges."""
+    """
+    Build knowledge graph for specified datasets.
+
+    Persistence happens entirely inside KnowledgeGraphService / kg_engine —
+    this endpoint no longer writes to knowledge_graph_edges directly.
+    See app/graph/kg_engine.py: detect_relationships() -> _save_edges(),
+    which correctly populates source_dataset_id / target_dataset_id as
+    INTEGER FKs via the ORM (KnowledgeGraphEdge model), with proper
+    dedup/invalidation logic already built in.
+    """
     service = KnowledgeGraphService()
     result = service.build_graph(db, dataset_ids)  # FIXED: db first, dataset_ids second
-
-    # Persist to DB for health metrics
-    try:
-        if isinstance(result, dict) and result.get("edges"):
-            _persist_kg_edges(result["edges"])
-    except Exception as e:
-        print(f"[kg_persist] Post-build persistence error (non-fatal): {e}")
-
     return result
 
 
@@ -173,18 +78,17 @@ class FolderRequest(BaseModel):
 
 @router.post("/knowledge-graph/folder")
 def get_kg_from_folder(req: FolderRequest):
-    """Build knowledge graph from Azure Blob folder and persist edges."""
+    """
+    Build knowledge graph from Azure Blob folder.
+
+    Same as above — no direct table writes here. If KnowledgeGraphService's
+    folder-based build path also needs row persistence, that should be
+    implemented inside the service layer using the same ORM-based approach
+    as kg_engine._save_edges(), not duplicated here.
+    """
     try:
         service = KnowledgeGraphService()
         result = service.build_graph_from_folder(req.folder)
-
-        # Persist to DB for health metrics
-        try:
-            if isinstance(result, dict) and result.get("edges"):
-                _persist_kg_edges(result["edges"], folder=req.folder)
-        except Exception as e:
-            print(f"[kg_persist] Post-folder-build persistence error (non-fatal): {e}")
-
         return result
 
     except Exception as e:

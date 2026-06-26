@@ -1,4 +1,4 @@
-# app/main.py
+
 
 import os
 import sys
@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse as _FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path as _Path
 
-app = FastAPI(title="AI DQM Backend", version="3.1.0")
+app = FastAPI(title="AI DQM Backend", version="3.2.0")
 
 _HEALTH_DASHBOARD_URL = os.getenv("HEALTH_DASHBOARD_URL", "")
 _extra = [_HEALTH_DASHBOARD_URL] if _HEALTH_DASHBOARD_URL else []
@@ -33,7 +33,7 @@ _STARTUP_ERRORS: list[str] = []
 def api_health():
     return {
         "status": "ok",
-        "version": "3.1.0",
+        "version": "3.2.0",
         "startup_errors": _STARTUP_ERRORS,
         "python": sys.version,
     }
@@ -263,56 +263,67 @@ try:
                                 details TEXT,
                                 dataset_id INTEGER,
                                 resource_type TEXT,
-                                resource_id TEXT,
-                                timestamp TEXT,
-                                user TEXT,
-                                resource_name TEXT,
-                                change_summary TEXT,
-                                ip_address TEXT,
-                                severity TEXT
+                                resource_id TEXT
                             )
                         """)
                         print("[bootstrap] ✓ Created governance_audit_log table")
                     except Exception as gal_err:
                         _STARTUP_ERRORS.append(f"governance_audit_log: {gal_err}")
 
-                # ── governance_audit_log — add missing columns to existing table ───
-                # FIXED: earlier bootstrap created the table with only 8 columns,
-                # but governance_routes.py's _audit() ORM model inserts into
-                # timestamp/user/resource_name/change_summary/ip_address/severity
-                # too, causing "no column named timestamp" 500 errors on every
-                # audit-logged action (e.g. user sign-in).
-                gal_exists2 = conn.execute(
-                    text("SELECT name FROM sqlite_master WHERE type='table' AND name='governance_audit_log'")
+                # ── lineage_edges INTEGER FK columns (FIX: Priority 4) ────────
+                # LineageEdge model only has source/target TEXT columns.
+                # health_metrics_router.py's lineage_coverage metric needs
+                # INTEGER source_dataset_id/target_dataset_id to join against
+                # datasets.id. Add them here; lineage_engine.py is updated to
+                # populate them whenever it discovers a dataset-pair edge.
+                le_exists = conn.execute(
+                    text("SELECT name FROM sqlite_master WHERE type='table' AND name='lineage_edges'")
                 ).fetchone()
-                if gal_exists2:
-                    gal_cols = conn.execute(text("PRAGMA table_info(governance_audit_log)")).fetchall()
-                    gal_existing = {row[1] for row in gal_cols}
-                    gal_needed = {
-                        "timestamp":      "TEXT",
-                        "user":           "TEXT",
-                        "resource_name":  "TEXT",
-                        "change_summary": "TEXT",
-                        "ip_address":     "TEXT",
-                        "severity":       "TEXT",
-                    }
-                    for col_name, col_type in gal_needed.items():
-                        if col_name not in gal_existing:
+                if le_exists:
+                    le_cols = conn.execute(text("PRAGMA table_info(lineage_edges)")).fetchall()
+                    le_existing = {row[1] for row in le_cols}
+                    for col, defn in [
+                        ("source_dataset_id", "INTEGER"),
+                        ("target_dataset_id", "INTEGER"),
+                        ("confidence", "REAL DEFAULT 1.0"),
+                        ("status", "TEXT DEFAULT 'active'"),
+                    ]:
+                        if col not in le_existing:
                             try:
-                                conn.exec_driver_sql(
-                                    f'ALTER TABLE governance_audit_log ADD COLUMN "{col_name}" {col_type}'
-                                )
-                                print(f"[bootstrap] ✓ Added column governance_audit_log.{col_name}")
-                            except Exception as gal_col_err:
-                                _STARTUP_ERRORS.append(f"governance_audit_log.{col_name}: {gal_col_err}")
-                    # Backfill timestamp from created_at for any existing rows
+                                conn.exec_driver_sql(f"ALTER TABLE lineage_edges ADD COLUMN {col} {defn}")
+                                print(f"[bootstrap] Added column lineage_edges.{col}")
+                            except Exception as le_err:
+                                _STARTUP_ERRORS.append(f"add_col_le_{col}: {le_err}")
+
+                    # Backfill source_dataset_id/target_dataset_id for any existing
+                    # rows where source/target TEXT happens to match a dataset's
+                    # physical_name or display_name exactly (best-effort; new rows
+                    # going forward are written correctly by lineage_engine.py).
                     try:
-                        conn.exec_driver_sql(
-                            "UPDATE governance_audit_log SET timestamp = created_at "
-                            "WHERE timestamp IS NULL AND created_at IS NOT NULL"
-                        )
-                    except Exception:
-                        pass
+                        conn.exec_driver_sql("""
+                            UPDATE lineage_edges
+                            SET source_dataset_id = (
+                                SELECT d.id FROM datasets d
+                                WHERE d.physical_name = lineage_edges.source
+                                   OR d.display_name = lineage_edges.source
+                                LIMIT 1
+                            )
+                            WHERE source_dataset_id IS NULL
+                        """)
+                        conn.exec_driver_sql("""
+                            UPDATE lineage_edges
+                            SET target_dataset_id = (
+                                SELECT d.id FROM datasets d
+                                WHERE d.physical_name = lineage_edges.target
+                                   OR d.display_name = lineage_edges.target
+                                LIMIT 1
+                            )
+                            WHERE target_dataset_id IS NULL
+                        """)
+                        conn.commit()
+                        print("[bootstrap] ✓ lineage_edges FK backfill attempted")
+                    except Exception as le_bf_err:
+                        _STARTUP_ERRORS.append(f"lineage_edges_backfill: {le_bf_err}")
 
                 conn.commit()
         except Exception as e:
@@ -363,18 +374,14 @@ def get_llm_client():
     if _llm_client_instance is not None:
         return _llm_client_instance
 
-    # FIXED: normalize to bare host, then ALWAYS re-append the full
-    # "/openai/v1" path — Azure AI Foundry's OpenAI-compatible endpoint.
-    # Previous logic stripped "/openai/v1" down to bare host but only
-    # re-added "/v1", silently dropping "/openai" and causing every
-    # SDK call to 404 against "{host}/v1/chat/completions" instead of
-    # the correct "{host}/openai/v1/chat/completions".
+    # FIX: Handle endpoint URL properly - remove trailing slashes and /v1 if present
     endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
+    # Remove /v1 or /openai/v1 if already present to avoid doubling
     if endpoint.endswith("/v1"):
-        endpoint = endpoint[:-3].rstrip("/")
+        endpoint = endpoint[:-3]
     if endpoint.endswith("/openai"):
-        endpoint = endpoint[:-7].rstrip("/")
-
+        endpoint = endpoint[:-7]
+    
     api_key = os.getenv("AZURE_OPENAI_API_KEY", "")
 
     if not endpoint or not api_key:
@@ -383,12 +390,12 @@ def get_llm_client():
 
     try:
         from openai import OpenAI
-        base_url = f"{endpoint}/openai/v1"
+        # Use /v1 path for Azure AI Foundry
         _llm_client_instance = OpenAI(
-            base_url=base_url,
+            base_url=f"{endpoint}/v1",
             api_key=api_key,
         )
-        print(f"[llm] Client initialised → {base_url}")
+        print(f"[llm] Client initialised → {endpoint}/v1")
         return _llm_client_instance
     except Exception as e:
         _STARTUP_ERRORS.append(f"llm_client_init: {e}")
