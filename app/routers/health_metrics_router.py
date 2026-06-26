@@ -228,11 +228,21 @@ def _introspect(conn) -> dict:
 
     # dq_rules source column
     dr_rule_cols = _columns(conn, "dq_rules")
-    s["rule_source_col"] = _find_col(dr_rule_cols, ["source", "rule_source", "origin"])
+    # FIXED: DQRule model has NO "source" column — the AI-origin field is
+    # "input_mode" (values: manual | nl | regex | dsl | ai).
+    # _find_col returns the first col name found in the actual table columns.
+    s["rule_source_col"] = _find_col(dr_rule_cols, ["input_mode", "source", "rule_source", "origin"])
+    s["rule_source_ai_value"] = "ai" if "input_mode" in dr_rule_cols else None
 
     # dq_rule_runs — rule FK column
+    # FIXED: dq_rule_runs has NO per-rule FK (only dataset_id). The per-rule
+    # data lives in dq_rule_run_results (rule_code, pass_rate). We expose
+    # the join path as a special sentinel so the DQ Rules tab can detect it.
     rr_cols = _columns(conn, "dq_rule_runs")
     s["rr_rule_id_col"] = _find_col(rr_cols, ["rule_id", "dq_rule_id", "rule"])
+    # Track whether the richer dq_rule_run_results table exists and has rule_code
+    rr_res_cols = _columns(conn, "dq_rule_run_results") if _table_exists(conn, "dq_rule_run_results") else set()
+    s["rr_res_rule_code_col"] = "rule_code" if "rule_code" in rr_res_cols else None
 
     # ── governance_policies ───────────────────────────────────────────────────
     policy_table = "ai_policies" if _table_exists(conn, "ai_policies") else "governance_policies"
@@ -814,7 +824,9 @@ def _tab_dq_scores(conn, s, dataset_id) -> dict:
 def _tab_dq_rules(conn, s, dataset_id) -> dict:
     act_status  = s["rule_active_status"]
     source_col  = s["rule_source_col"]
-    rr_rule_col = s["rr_rule_id_col"]
+    rr_rule_col     = s["rr_rule_id_col"]
+    rr_res_code_col = s.get("rr_res_rule_code_col")   # rule_code in dq_rule_run_results
+    rule_source_ai  = s.get("rule_source_ai_value")   # "ai" when input_mode col exists
     dr_cols     = _columns(conn, "dq_rules")
     has_ds      = "dataset_id" in dr_cols
     rr_exists   = _table_exists(conn, "dq_rule_runs")
@@ -835,12 +847,29 @@ def _tab_dq_rules(conn, s, dataset_id) -> dict:
     total_rules  = row_rules["total"]  if row_rules else 0
 
     # ── rule_execution_success_rate ───────────────────────────────────────────
-    # Active rules (in scope) that have AT LEAST ONE recorded run in
-    # dq_rule_runs. Joined on dq_rules.id so runs belonging to another
-    # dataset's rules can never leak into this dataset's count — the
-    # previous version counted ALL distinct rule_ids ever run, globally.
+    # FIXED: dq_rule_runs has NO per-rule FK (only dataset_id). Per-rule
+    # execution data lives in dq_rule_run_results (rule_code, pass_rate).
+    # Strategy: JOIN dq_rule_run_results → dq_rules on rule_code to count
+    # distinct active rules that have been exercised.
     executed = 0
-    if rr_rule_col and rr_exists:
+    avg_run_pass_rate = None
+
+    if rr_res_code_col and _table_exists(conn, "dq_rule_run_results"):
+        # Path 1 (preferred): dq_rule_run_results.rule_code JOIN dq_rules.rule_code
+        st_p  = [act_status]  if act_status  else []
+        ds_p2 = [dataset_id]  if (dataset_id and has_ds) else []
+        st_cl = "AND r.status = ?"       if act_status              else ""
+        ds_cl = "AND r.dataset_id = ?"   if (dataset_id and has_ds) else ""
+        row_exec = _one(conn,
+            f"SELECT COUNT(DISTINCT r.id) as ex, AVG(res.pass_rate) as avg_pass "
+            f"FROM dq_rules r "
+            f"JOIN dq_rule_run_results res ON res.rule_code = r.rule_code "
+            f"WHERE 1=1 {st_cl} {ds_cl}", st_p + ds_p2)
+        executed      = row_exec["ex"]       if row_exec else 0
+        avg_run_pass_rate = (round(row_exec["avg_pass"] * 100, 1)
+                             if row_exec and row_exec["avg_pass"] is not None else None)
+    elif rr_rule_col and rr_exists:
+        # Path 2 (fallback): old schema with direct rule_id FK
         join_status = "AND r.status = ?" if act_status else ""
         join_ds     = "AND r.dataset_id = ?" if (dataset_id and has_ds) else ""
         join_p = ([act_status] if join_status else []) + ([dataset_id] if join_ds else [])
@@ -851,64 +880,68 @@ def _tab_dq_rules(conn, s, dataset_id) -> dict:
             f"WHERE 1=1 {join_status} {join_ds}", join_p)
         executed = row_exec["ex"] if row_exec else 0
 
-    # Run-level detail: real pass-rate across executions, when dq_rule_runs
-    # exposes aggregate pass/total counts per run (same columns the DQ
-    # Scores tab falls back to).
-    rr_cols  = _columns(conn, "dq_rule_runs") if rr_exists else set()
-    pass_col = _find_col(rr_cols, ["passed_count", "passed", "pass_count"])
-    tot_col  = _find_col(rr_cols, ["total_count", "row_count", "evaluated_count", "total"])
-    avg_run_pass_rate = None
-    if rr_rule_col and pass_col and tot_col and rr_exists:
-        join_ds2 = "AND r.dataset_id = ?" if (dataset_id and has_ds) else ""
-        p2 = [dataset_id] if join_ds2 else []
-        row_runs = _one(conn,
-            f"SELECT COALESCE(SUM(rr.{pass_col}),0) as p, COALESCE(SUM(rr.{tot_col}),0) as t "
-            f"FROM dq_rule_runs rr JOIN dq_rules r ON rr.{rr_rule_col} = r.id "
-            f"WHERE 1=1 {join_ds2}", p2)
-        if row_runs and row_runs["t"]:
-            avg_run_pass_rate = safe_pct(row_runs["p"], row_runs["t"])
-
     resr_val    = safe_pct(executed, active_rules)
     resr_status = _status(resr_val, healthy_ge=80, critical_lt=30)
 
     # ── rule_recommendation_acceptance_rate ───────────────────────────────────
-    # AI-origin values must be discovered from dq_rules.source ITSELF.
-    # The previous version borrowed "policy_source_values" — the distinct
-    # `source` values from the governance_policies table — which has
-    # nothing to do with DQ rule provenance and silently broke this metric.
-    ai_sources = set()
-    if source_col:
+    # FIXED: DQRule has no "source" column — AI-origin is tracked via
+    # input_mode = 'ai'.  approve_ai_recommended_rule() now sets input_mode='ai'
+    # (patched in app/services/dq_rules.py).
+    #
+    # When input_mode col exists:  count WHERE input_mode='ai'
+    # When only old source col:    count using keyword matching as before
+    ai_suggested = 0
+    ai_accepted  = 0
+
+    if rule_source_ai and source_col == "input_mode":
+        # input_mode='ai' path (current schema)
+        row_sugg = _one(conn,
+            f"SELECT COUNT(*) as cnt, "
+            f"COUNT(CASE WHEN status='{act_status or 'Active'}' THEN 1 END) as acc "
+            f"FROM dq_rules WHERE input_mode='ai' {ds_r}", r_p)
+        ai_suggested = row_sugg["cnt"] if row_sugg else 0
+        ai_accepted  = row_sugg["acc"] if row_sugg else 0
+    elif source_col and source_col != "input_mode":
+        # Legacy "source" column path
         rows = _all(conn,
             f"SELECT DISTINCT {source_col} as v FROM dq_rules WHERE {source_col} IS NOT NULL")
         ai_keywords = ("ai", "llm", "gpt", "auto", "recommend", "generated", "model", "suggested")
         ai_sources = {r["v"] for r in rows if r["v"] and any(k in str(r["v"]).lower() for k in ai_keywords)}
-    in_cl = ", ".join(f"'{v}'" for v in ai_sources)
+        if ai_sources:
+            in_cl = ", ".join(f"'{v}'" for v in ai_sources)
+            row_sugg = _one(conn,
+                f"SELECT COUNT(*) as cnt FROM dq_rules WHERE {source_col} IN ({in_cl}) {ds_r}", r_p)
+            ai_suggested = row_sugg["cnt"] if row_sugg else 0
+            if act_status:
+                row_acc = _one(conn,
+                    f"SELECT COUNT(*) as cnt FROM dq_rules WHERE {source_col} IN ({in_cl}) "
+                    f"AND status = ? {ds_r}", [act_status] + r_p)
+                ai_accepted = row_acc["cnt"] if row_acc else 0
 
-    ai_suggested = 0
-    if source_col and ai_sources:
-        row_sugg = _one(conn,
-            f"SELECT COUNT(*) as cnt FROM dq_rules WHERE {source_col} IN ({in_cl}) {ds_r}", r_p)
-        ai_suggested = row_sugg["cnt"] if row_sugg else 0
-
-    ai_accepted = 0
-    if source_col and ai_sources and act_status:
-        row_acc = _one(conn,
-            f"SELECT COUNT(*) as cnt FROM dq_rules WHERE {source_col} IN ({in_cl}) "
-            f"AND status = ? {ds_r}", [act_status] + r_p)
-        ai_accepted = row_acc["cnt"] if row_acc else 0
-
-    rrar_val    = safe_pct(ai_accepted, ai_suggested) if (act_status and ai_suggested) else None
+    rrar_val    = safe_pct(ai_accepted, ai_suggested) if ai_suggested else None
     rrar_status = _status(rrar_val, healthy_ge=70, critical_lt=20) if rrar_val is not None else "neutral"
 
     # ── hallucinated_rule_rate ────────────────────────────────────────────────
+    # AI rules approved but never exercised through DQ Engine
     never_run = 0
-    if source_col and ai_sources and ai_suggested and rr_rule_col:
-        ds_alias = "AND r.dataset_id = ?" if (dataset_id and has_ds) else ""
-        row_nv = _one(conn,
-            f"SELECT COUNT(*) as nv FROM dq_rules r "
-            f"WHERE r.{source_col} IN ({in_cl}) "
-            f"AND NOT EXISTS (SELECT 1 FROM dq_rule_runs rr WHERE rr.{rr_rule_col} = r.id) {ds_alias}",
-            r_p)
+    if ai_suggested > 0:
+        ds_al = "AND r.dataset_id = ?" if (dataset_id and has_ds) else ""
+        nr_p  = r_p if (dataset_id and has_ds) else []
+        if rule_source_ai and source_col == "input_mode" and rr_res_code_col:
+            # New schema: check via dq_rule_run_results
+            row_nv = _one(conn,
+                "SELECT COUNT(*) as nv FROM dq_rules r "
+                "WHERE r.input_mode='ai' "
+                "AND NOT EXISTS (SELECT 1 FROM dq_rule_run_results res "
+                "               WHERE res.rule_code = r.rule_code) " + ds_al, nr_p)
+        elif rr_rule_col and source_col and source_col != "input_mode":
+            row_nv = _one(conn,
+                f"SELECT COUNT(*) as nv FROM dq_rules r "
+                f"WHERE 1=1 "
+                f"AND NOT EXISTS (SELECT 1 FROM dq_rule_runs rr WHERE rr.{rr_rule_col}=r.id) "
+                + ds_al, nr_p)
+        else:
+            row_nv = None
         never_run = row_nv["nv"] if row_nv else 0
     hrr_val    = safe_pct(never_run, ai_suggested) if ai_suggested else None
     hrr_status = _status(hrr_val, healthy_le=10, critical_gt=50) if hrr_val is not None else "neutral"

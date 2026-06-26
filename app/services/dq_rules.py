@@ -592,15 +592,19 @@ def create_rule(
     column: Optional[str] = None,
     severity: str = "Medium",
     status: str = "Active",
-    source: Optional[str] = None,   # FIX: track rule origin (e.g. "ai", "manual")
 ) -> Dict[str, Any]:
     ds = db.query(Dataset).filter(Dataset.id == dataset_id).first()
     if not ds:
         raise ValueError("Dataset not found")
  
     mode = (input_mode or "").lower().strip()
-    if mode not in {"nl", "regex", "dsl"}:
-        raise ValueError("input_mode must be one of: nl, regex, dsl")
+    # FIXED: allow "ai" input_mode — approved AI-suggested rules are stored
+    # with input_mode="ai" so health_metrics_router can detect them.
+    # "ai" mode behaves identically to "dsl" (condition passed in directly).
+    if mode not in {"nl", "regex", "dsl", "ai"}:
+        raise ValueError("input_mode must be one of: nl, regex, dsl, ai")
+    if mode == "ai":
+        mode = "dsl"   # process as DSL; persisted as "ai" via the ORM field
  
     if severity not in ALLOWED_SEVERITY:
         raise ValueError(f"severity must be one of: {', '.join(sorted(ALLOWED_SEVERITY))}")
@@ -653,6 +657,10 @@ def create_rule(
     code = _next_rule_code(db, dataset_id)
     final_name = (name or "").strip() or f"{column} Rule"
  
+    # Re-map mode back to the caller's original input_mode value so "ai" is
+    # preserved in the database (mode was internally redirected to "dsl" for
+    # condition parsing, but the DB field must stay "ai" for health metrics).
+    persist_mode = (input_mode or "").lower().strip()
     rule = DQRule(
         dataset_id=dataset_id,
         rule_code=code,
@@ -662,11 +670,10 @@ def create_rule(
         condition=condition,
         severity=severity,
         status=status,
-        input_mode=mode,
+        input_mode=persist_mode,
         nl_text=nl_text,
         regex_pattern=regex_pattern,
         meta=None,
-        source=source,   # FIX: persist origin tag ("ai", "manual", etc.)
     )
     db.add(rule)
  
@@ -744,14 +751,13 @@ def approve_ai_recommended_rule(db: Session, dataset_id: int, rule_payload: Dict
     created = create_rule(
         db,
         dataset_id,
-        input_mode="dsl",
+        input_mode="ai",       # FIXED: preserve AI origin so health metrics can detect it
         text=condition,
         name=name,
         rule_type=rule_type,
         column=column,
         severity=severity,
         status="Active",
-        source="ai",   # FIX: mark as AI-origin so health metrics can track acceptance rate
     )
  
     if existing_pending_rules:
