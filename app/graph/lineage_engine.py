@@ -85,6 +85,102 @@ def invalidate_cache() -> None:
         invalidate_cache()
     """
     _cache.invalidate()
+
+
+# ── Lineage Edge Persistence ───────────────────────────────────────────────────
+
+def _persist_lineage_edges(nodes_map: dict, edges: list) -> int:
+    """
+    Write dataset-to-dataset edges from the in-memory lineage graph to the
+    lineage_edges table with source_dataset_id / target_dataset_id INTEGER FKs.
+
+    health_metrics_router queries those integer columns for lineage_coverage;
+    without this step the table stays empty and coverage reads 0%.
+
+    Only "table"-type nodes have a dataset_db_id — path/folder nodes are skipped.
+    Non-fatal: a failure here never breaks the graph API response.
+    """
+    saved = 0
+    try:
+        from app.database import engine
+        from sqlalchemy import text
+
+        # Build node_id → dataset_db_id lookup (only for leaf "table" nodes)
+        node_ds_id: dict[str, int] = {
+            nid: n["dataset_db_id"]
+            for nid, n in nodes_map.items()
+            if n.get("type") == "table" and n.get("dataset_db_id")
+        }
+        if not node_ds_id:
+            return 0
+
+        with engine.connect() as conn:
+            # Confirm table + integer FK columns exist (added by bootstrap migration)
+            tbl = conn.execute(text(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='lineage_edges'"
+            )).fetchone()
+            if not tbl:
+                print("[lineage_persist] lineage_edges table missing — skipping")
+                return 0
+
+            le_cols_raw = conn.execute(text("PRAGMA table_info(lineage_edges)")).fetchall()
+            le_cols = {row[1] for row in le_cols_raw}
+            if "source_dataset_id" not in le_cols or "target_dataset_id" not in le_cols:
+                print("[lineage_persist] source_dataset_id/target_dataset_id columns missing — "
+                      "restart backend to trigger bootstrap migration")
+                return 0
+
+            # Wipe previously auto-generated edges (keep user-defined ones if status col exists)
+            try:
+                if "status" in le_cols:
+                    conn.execute(text(
+                        "DELETE FROM lineage_edges WHERE status = 'auto' "
+                        "OR (status IS NULL AND source_dataset_id IS NOT NULL)"
+                    ))
+                else:
+                    conn.execute(text(
+                        "DELETE FROM lineage_edges WHERE source_dataset_id IS NOT NULL"
+                    ))
+            except Exception:
+                pass  # Non-fatal
+
+            for edge in edges:
+                src_id = node_ds_id.get(edge["source"])
+                tgt_id = node_ds_id.get(edge["target"])
+                if src_id is None or tgt_id is None or src_id == tgt_id:
+                    continue  # Skip folder→folder or folder→table hops
+
+                row: dict = {
+                    "source_dataset_id": src_id,
+                    "target_dataset_id": tgt_id,
+                }
+                # Optionally set source/target text if the columns exist
+                if "source" in le_cols:
+                    row["source"] = str(src_id)
+                if "target" in le_cols:
+                    row["target"] = str(tgt_id)
+                if "confidence" in le_cols:
+                    row["confidence"] = 1.0
+                if "status" in le_cols:
+                    row["status"] = "auto"
+
+                cols_str = ", ".join(row.keys())
+                vals_str = ", ".join(f":{k}" for k in row.keys())
+                try:
+                    conn.execute(
+                        text(f"INSERT OR IGNORE INTO lineage_edges ({cols_str}) VALUES ({vals_str})"),
+                        row,
+                    )
+                    saved += 1
+                except Exception:
+                    pass
+
+            conn.commit()
+            print(f"[lineage_persist] Saved {saved} dataset→dataset edges to lineage_edges")
+
+    except Exception as e:
+        print(f"[lineage_persist] Persistence failed (non-fatal): {e}")
+    return saved
  
  
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -264,6 +360,13 @@ def _get_azure_graph() -> dict:
                 pass  # LineageEdge table may not exist yet on first run
  
             _cache.set(result)
+
+            # Persist dataset→dataset edges so health_metrics lineage_coverage works
+            try:
+                _persist_lineage_edges(nodes_map, edges)
+            except Exception as persist_err:
+                print(f"[lineage_engine] Edge persistence failed (non-fatal): {persist_err}")
+
             return result
  
         finally:

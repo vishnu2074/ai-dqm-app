@@ -592,6 +592,7 @@ def create_rule(
     column: Optional[str] = None,
     severity: str = "Medium",
     status: str = "Active",
+    source: Optional[str] = None,   # FIX: track rule origin (e.g. "ai", "manual")
 ) -> Dict[str, Any]:
     ds = db.query(Dataset).filter(Dataset.id == dataset_id).first()
     if not ds:
@@ -665,6 +666,7 @@ def create_rule(
         nl_text=nl_text,
         regex_pattern=regex_pattern,
         meta=None,
+        source=source,   # FIX: persist origin tag ("ai", "manual", etc.)
     )
     db.add(rule)
  
@@ -749,6 +751,7 @@ def approve_ai_recommended_rule(db: Session, dataset_id: int, rule_payload: Dict
         column=column,
         severity=severity,
         status="Active",
+        source="ai",   # FIX: mark as AI-origin so health metrics can track acceptance rate
     )
  
     if existing_pending_rules:
