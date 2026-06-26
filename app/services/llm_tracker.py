@@ -5,24 +5,8 @@ Central LLM call tracker — dual-write to:
   1. SQLite  llm_calls  table  (primary source for /api/llm-metrics dashboard)
   2. Langfuse Cloud            (optional; enables full trace inspection UI)
 
-FIXED (this version):
-  Langfuse Python SDK v4 REMOVED the old `Langfuse().trace()` / `trace.generation()`
-  API entirely. Calling them (as the previous version did) raises AttributeError,
-  which was being swallowed by a broad except — so every call silently failed to
-  reach Langfuse Cloud, even though the SQLite write worked fine.
-
-  v4 uses an OpenTelemetry-based API:
-      with langfuse_client.start_as_current_generation(
-          name=..., model=..., input=..., model_parameters=...,
-      ) as gen:
-          gen.update(output=..., usage_details={...}, metadata={...})
-
-  This version uses that API, wrapped so a missing/old SDK or any internal
-  Langfuse error still never breaks the request — SQLite write always succeeds
-  independently of Langfuse status.
-
 Usage in any service:
-    from app.services.llm_tracker import track_llm_call
+    from app.services.llm_tracker import track_llm_call, track_error
     import time
 
     _t0 = time.time()
@@ -58,20 +42,13 @@ from datetime import datetime, timezone
 from typing import Optional
 
 # ── Langfuse singleton ────────────────────────────────────────────────────────
-_lf            = None
-_lf_ready      = False
-_lf_lock       = threading.Lock()
-_lf_sdk_v4     = False   # True if the installed SDK exposes the v4 API we need
+_lf        = None
+_lf_ready  = False
+_lf_lock   = threading.Lock()
 
 
 def _get_langfuse():
-    """
-    Lazily create and cache a Langfuse client. Detects whether the installed
-    SDK exposes the v4 `start_as_current_generation` API. If it doesn't
-    (old SDK, or SDK missing entirely), `_lf` stays usable for nothing and
-    `_send_to_langfuse` becomes a guaranteed no-op.
-    """
-    global _lf, _lf_ready, _lf_sdk_v4
+    global _lf, _lf_ready
     if _lf_ready:
         return _lf
     with _lf_lock:
@@ -83,23 +60,10 @@ def _get_langfuse():
         if pk and sk:
             try:
                 from langfuse import Langfuse
-                client = Langfuse(public_key=pk, secret_key=sk, host=host)
-                # v4 API surface check — this is the method we actually need.
-                if hasattr(client, "start_as_current_generation"):
-                    _lf = client
-                    _lf_sdk_v4 = True
-                    print("[llm_tracker] ✓ Langfuse v4 connected → cloud.langfuse.com")
-                elif hasattr(client, "trace"):
-                    # Old v2/v3 SDK installed — still usable, different code path.
-                    _lf = client
-                    _lf_sdk_v4 = False
-                    print("[llm_tracker] ✓ Langfuse legacy (v2/v3) SDK connected")
-                else:
-                    print("[llm_tracker] Langfuse client has neither v4 nor legacy API — disabling")
-                    _lf = None
+                _lf = Langfuse(public_key=pk, secret_key=sk, host=host)
+                print("[llm_tracker] ✓ Langfuse connected → cloud.langfuse.com")
             except Exception as e:
                 print(f"[llm_tracker] Langfuse init failed (non-fatal): {e}")
-                _lf = None
         else:
             print("[llm_tracker] Langfuse keys not set — local DB tracking only")
         _lf_ready = True
@@ -142,6 +106,28 @@ def track_llm_call(
               error_type, metadata),
         daemon=True,
     ).start()
+
+
+def status_code_suffix(exception: Exception) -> str:
+    """
+    Enrich a generic exception class name with its HTTP status code when
+    available, so the dashboard's error breakdown shows "HTTPError_404"
+    instead of just "HTTPError" — makes auth/URL misconfigurations
+    immediately visible without digging through Render logs.
+    """
+    name = type(exception).__name__
+    # requests.exceptions.HTTPError → exception.response.status_code
+    resp = getattr(exception, "response", None)
+    if resp is not None:
+        code = getattr(resp, "status_code", None)
+        if code:
+            return f"{name}_{code}"
+    # httpx.HTTPStatusError → exception.response.status_code (same shape)
+    # openai SDK errors → exception.status_code directly
+    code = getattr(exception, "status_code", None)
+    if code:
+        return f"{name}_{code}"
+    return name
 
 
 def track_error(
@@ -196,62 +182,41 @@ def _send_to_langfuse(
     pt, ct, tt, latency_ms, success, error_type, metadata,
 ) -> None:
     """
-    Sends one generation event to Langfuse, using whichever API version
-    was detected by _get_langfuse(). Always non-fatal.
+    Langfuse SDK v4 API.
+    v2/v3's `lf.trace(...).generation(...)` was removed entirely in v4 —
+    the SDK now uses an OpenTelemetry-based observation model:
+    `start_observation(as_type="generation")` returns an object you
+    `.update()` with output/usage, then `.end()` to close it.
     """
     try:
         lf = _get_langfuse()
         if not lf:
             return
-
-        meta = {
-            "latency_ms": latency_ms,
-            "success":    success,
-            "error_type": error_type,
-            **(metadata or {}),
-        }
-
-        if _lf_sdk_v4:
-            # ── Langfuse Python SDK v4 (OpenTelemetry-based) ─────────────────
-            # start_as_current_generation is a context manager; on exit it
-            # flushes the span. We set output/usage via .update() before exit.
-            with lf.start_as_current_generation(
-                name=f"{feature}_generation",
-                model=model,
-                input=prompt[:3000] if prompt else "",
-                model_parameters={"source": "azure_ai_foundry"},
-                metadata={"ai_dqm_feature": feature, **meta},
-            ) as gen:
-                gen.update(
-                    output=response[:3000] if response else "",
-                    usage_details={
-                        "input":  pt or 0,
-                        "output": ct or 0,
-                        "total":  tt or 0,
-                    },
-                )
-            # v4 client batches/flushes on its own background thread, but we
-            # explicitly flush here since this call runs in a short-lived
-            # daemon thread that may exit before the SDK's own flush timer.
-            if hasattr(lf, "flush"):
-                lf.flush()
-        else:
-            # ── Legacy (v2/v3) API — kept for backward compatibility ─────────
-            trace = lf.trace(
-                name=f"ai_dqm_{feature}",
-                metadata={"model": model, **meta},
-            )
-            trace.generation(
-                name=f"{feature}_generation",
-                model=model,
-                model_parameters={"source": "azure_ai_foundry"},
-                input=prompt[:3000] if prompt else "",
-                output=response[:3000] if response else "",
-                usage={"input": pt or 0, "output": ct or 0, "total": tt or 0},
-                metadata=meta,
-            )
-            if hasattr(lf, "flush"):
-                lf.flush()
-
+        gen = lf.start_observation(
+            name=f"ai_dqm_{feature}",
+            as_type="generation",
+            model=model,
+            model_parameters={"source": "azure_ai_foundry"},
+            input=prompt[:3000] if prompt else "",
+            metadata={"feature": feature, **(metadata or {})},
+        )
+        gen.update(
+            output=response[:3000] if response else "",
+            usage_details={
+                "input":  pt or 0,
+                "output": ct or 0,
+                "total":  tt or 0,
+            },
+            level="DEFAULT" if success else "ERROR",
+            status_message=error_type if not success else None,
+            metadata={
+                "latency_ms": latency_ms,
+                "success":    success,
+                "error_type": error_type,
+                **(metadata or {}),
+            },
+        )
+        gen.end()
+        lf.flush()
     except Exception as e:
         print(f"[llm_tracker] Langfuse send failed (non-fatal): {e}")
