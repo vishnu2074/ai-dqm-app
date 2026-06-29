@@ -745,7 +745,7 @@ def approve_ai_recommended_rule(db: Session, dataset_id: int, rule_payload: Dict
     created = create_rule(
         db,
         dataset_id,
-        input_mode="dsl",
+        input_mode="ai",
         text=condition,
         name=name,
         rule_type=rule_type,

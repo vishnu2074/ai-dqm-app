@@ -80,19 +80,30 @@ def _infer_domain(name: str, physical_path: str = "") -> str:
 
 def _llm_chat(prompt: str, max_tokens: int = 1000) -> Optional[str]:
     """
-    Azure AI Foundry endpoint: {endpoint}/models/{model}/chat/completions
-    This differs from Azure OpenAI SDK which uses /openai/deployments/{model}/...
-    Using requests directly avoids the SDK routing mismatch that causes Connection errors.
+    Azure AI Foundry endpoint (serverless): {endpoint}/models/chat/completions
+    Model is specified in the request body, NOT in the URL path.
+    The URL format /models/{model}/chat/completions causes 404 — the correct
+    serverless API format puts the model in the JSON payload.
+
+    Your endpoint: https://dilip-mm4oi19h-eastus2.services.ai.azure.com/models/chat/completions
     """
     if not _AZURE_KEY or not _AZURE_ENDPOINT:
         return None
 
-    url = f"{_AZURE_ENDPOINT}/models/{_AZURE_MODEL}/chat/completions"
+    # Azure AI Foundry serverless: /models/chat/completions (model in body)
+    # Strip any accidental trailing path segments from the env var
+    ep = _AZURE_ENDPOINT
+    for _sfx in ["/chat/completions", "/models"]:
+        while ep.endswith(_sfx):
+            ep = ep[:-len(_sfx)].rstrip("/")
+    url = f"{ep}/models/chat/completions"
+
     try:
         resp = _http.post(
             url,
             headers={"Content-Type": "application/json", "api-key": _AZURE_KEY},
             json={
+                "model": _AZURE_MODEL,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.1,
                 "max_tokens": max_tokens,

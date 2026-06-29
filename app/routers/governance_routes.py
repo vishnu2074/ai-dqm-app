@@ -193,15 +193,17 @@ def _p2d(p): return {
     "updated_at":     p.updated_at    or str(date.today()),
 }
 def _u2d(u): return {
-    "id":              u.id              or "",
-    "name":            u.name            or "",
-    "email":           u.email           or "",
-    "role":            u.role            or "Viewer",
-    "status":          u.status          or "Pending",
-    "login_method":    u.login_method    or "unknown",
-    "last_active":     u.last_active     or "Never",
-    "created_at":      u.created_at      or str(date.today()),
-    "datasets_access": u.datasets_access or 0,
+    "id":              str(u.id    or ""),
+    "name":            str(u.name  or ""),
+    "email":           str(u.email or ""),
+    "role":            str(u.role  or "Viewer"),
+    "roles":           str(u.role  or "Viewer"),   # alias — frontend may expect either
+    "status":          str(u.status         or "Pending"),
+    "login_method":    str(getattr(u, "login_method", None) or "unknown"),
+    "last_active":     str(u.last_active    or "Never"),
+    "created_at":      str(u.created_at     or str(date.today())),
+    "datasets_access": int(u.datasets_access or 0),
+    "permissions":     [],   # empty list guard — frontend .split() on null crashes
 }
 
 def _n2d(n):
@@ -504,6 +506,7 @@ def create_user(body: dict, request: Request, db: Session=Depends(get_db)):
         email=body.get("email",""),
         role=body.get("role","Viewer"),
         status=body.get("status","Pending"),
+        login_method=body.get("login_method","unknown"),
         datasets_access=body.get("datasets_access",0),
         last_active="Never",
         created_at=str(date.today()),
