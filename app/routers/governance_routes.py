@@ -30,6 +30,7 @@ class GovernancePolicy(Base):
     description    = Column(Text, default="")
     status         = Column(String, default="Draft")
     policy_type    = Column(String, default="Quality")
+    source         = Column(String, default="manual")   # "ai" for AI-suggested, "manual" for user-created
     datasets_count = Column(Integer, default=0)
     rules          = Column(JSON, default=list)
     created_at     = Column(String, default=lambda: str(date.today()))
@@ -83,6 +84,10 @@ for _migration_sql in [
     "ALTER TABLE governance_notifications ADD COLUMN slack_webhook TEXT",
     "ALTER TABLE governance_notifications ADD COLUMN recipient_email TEXT",
     "ALTER TABLE governance_notifications ADD COLUMN channel TEXT DEFAULT 'in_app'",
+    # governance_policies.source — needed for AI policy adoption tracking
+    "ALTER TABLE governance_policies ADD COLUMN source TEXT DEFAULT 'manual'",
+    # governance_users.login_method — ensure column exists (prevents null crash)
+    "ALTER TABLE governance_users ADD COLUMN login_method TEXT DEFAULT 'unknown'",
 ]:
     try:
         with engine.connect() as _c:
@@ -90,6 +95,17 @@ for _migration_sql in [
             _c.commit()
     except Exception:
         pass
+
+# Backfill NULL login_method values so _u2d never returns null for that field
+try:
+    with engine.connect() as _c:
+        _c.execute(text("UPDATE governance_users SET login_method = 'unknown' WHERE login_method IS NULL"))
+        _c.execute(text("UPDATE governance_users SET role = 'Viewer' WHERE role IS NULL"))
+        _c.execute(text("UPDATE governance_users SET status = 'Pending' WHERE status IS NULL"))
+        _c.execute(text("UPDATE governance_users SET last_active = 'Never' WHERE last_active IS NULL"))
+        _c.commit()
+except Exception:
+    pass
 
 # ─── Seeds ────────────────────────────────────────────────────────────────────
 
@@ -164,8 +180,29 @@ def _audit(db, action, rt, rn, cs, sev="info", user="System", ip="unknown"):
     db.add(e); db.commit()
     return {c.name: getattr(e,c.name) for c in e.__table__.columns}
 
-def _p2d(p): return {"id":p.id,"name":p.name,"description":p.description,"status":p.status,"policy_type":p.policy_type,"datasets_count":p.datasets_count,"rules":p.rules or [],"created_at":p.created_at,"updated_at":p.updated_at}
-def _u2d(u): return {"id":u.id,"name":u.name,"email":u.email,"role":u.role,"status":u.status,"login_method":u.login_method,"last_active":u.last_active,"created_at":u.created_at,"datasets_access":u.datasets_access}
+def _p2d(p): return {
+    "id":             p.id,
+    "name":           p.name,
+    "description":    p.description   or "",
+    "status":         p.status        or "Draft",
+    "policy_type":    p.policy_type   or "Quality",
+    "source":         getattr(p, "source", None) or "manual",
+    "datasets_count": p.datasets_count or 0,
+    "rules":          p.rules         or [],
+    "created_at":     p.created_at    or str(date.today()),
+    "updated_at":     p.updated_at    or str(date.today()),
+}
+def _u2d(u): return {
+    "id":              u.id              or "",
+    "name":            u.name            or "",
+    "email":           u.email           or "",
+    "role":            u.role            or "Viewer",
+    "status":          u.status          or "Pending",
+    "login_method":    u.login_method    or "unknown",
+    "last_active":     u.last_active     or "Never",
+    "created_at":      u.created_at      or str(date.today()),
+    "datasets_access": u.datasets_access or 0,
+}
 
 def _n2d(n):
     return {
@@ -402,6 +439,7 @@ def create_policy(body: dict, request: Request, db: Session=Depends(get_db)):
         description=body.get("description",""),
         status=body.get("status","Draft"),
         policy_type=body.get("policy_type","Quality"),
+        source=body.get("source","manual"),
         datasets_count=body.get("datasets_count",0),
         rules=body.get("rules",[]),
         created_at=str(date.today()),
@@ -657,12 +695,65 @@ def dismiss_suggestion(sid: str, db: Session=Depends(get_db)):
     if not db.query(GovernanceDismissedSuggestion).filter(GovernanceDismissedSuggestion.id==sid).first():
         db.add(GovernanceDismissedSuggestion(id=sid)); db.commit()
 
-@governance_router.post("/policy-suggestions/{sid}/adopt", status_code=204)
+@governance_router.post("/policy-suggestions/{sid}/adopt", status_code=201)
 def adopt_suggestion(sid: str, request: Request, db: Session=Depends(get_db)):
+    """
+    FIXED: Previously only dismissed the suggestion without creating a GovernancePolicy.
+    Now creates an Active policy in governance_policies so it appears in the Data
+    Policies tab and is counted by the health metrics policy_adoption_rate metric.
+    """
+    t = next((x for x in SUGGESTION_TEMPLATES if x["id"]==sid), None)
+    if not t:
+        # Not a template suggestion — still mark dismissed so it disappears
+        if not db.query(GovernanceDismissedSuggestion).filter(GovernanceDismissedSuggestion.id==sid).first():
+            db.add(GovernanceDismissedSuggestion(id=sid))
+            db.commit()
+        return {"status": "dismissed", "policy": None}
+
+    # Check if an Active policy with this name already exists
+    existing = db.query(GovernancePolicy).filter(
+        func.lower(GovernancePolicy.name) == t["name"].lower()
+    ).first()
+    if existing:
+        # Already adopted — just ensure it's Active
+        existing.status = "Active"
+        existing.updated_at = str(date.today())
+        db.commit()
+        # Mark dismissed so it leaves suggestions list
+        if not db.query(GovernanceDismissedSuggestion).filter(GovernanceDismissedSuggestion.id==sid).first():
+            db.add(GovernanceDismissedSuggestion(id=sid))
+            db.commit()
+        _audit(db, "Policy Activated (Re-adopted)", "Policy", existing.name, "Re-adopted from AI suggestions", "info", _usr(request), _ip(request))
+        return {"status": "updated", "policy": _p2d(existing)}
+
+    # Create a new Active GovernancePolicy from the suggestion template
+    p = GovernancePolicy(
+        id=f"p_{uuid.uuid4().hex[:8]}",
+        name=t["name"],
+        description=t["description"],
+        status="Active",
+        policy_type=t["policy_type"],
+        source="ai",          # Mark as AI-suggested for health metrics
+        datasets_count=0,
+        rules=[],
+        created_at=str(date.today()),
+        updated_at=str(date.today()),
+    )
+    db.add(p)
+
+    # Mark suggestion as dismissed so it leaves the suggestions list
     if not db.query(GovernanceDismissedSuggestion).filter(GovernanceDismissedSuggestion.id==sid).first():
         db.add(GovernanceDismissedSuggestion(id=sid))
-    t = next((x for x in SUGGESTION_TEMPLATES if x["id"]==sid), None)
-    if t: _audit(db, "Policy Suggestion Adopted", "Policy", t["name"], "Adopted", "info", _usr(request), _ip(request))
+
+    db.commit()
+
+    _audit(db, "Policy Suggestion Adopted", "Policy", p.name, f"AI suggestion adopted as Active {p.policy_type} policy", "info", _usr(request), _ip(request))
+    _notify_for_action(db, "policy",
+        f"AI Policy Adopted: {p.name}",
+        f"AI-suggested policy '{p.name}' was adopted and is now Active.",
+        severity="info", link="/settings?tab=policies")
+
+    return {"status": "created", "policy": _p2d(p)}
 
 @governance_router.delete("/policy-suggestions/dismissed", status_code=204)
 def reset_dismissed(db: Session=Depends(get_db)):

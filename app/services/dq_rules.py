@@ -514,6 +514,7 @@ def update_rule(db: Session, dataset_id: int, rule_code: str, updates: Dict[str,
             severity="info",
             link=f"/dq-rules",
             dataset=ds_name,
+            dataset_id=dataset_id,
         )
     except Exception:
         pass
@@ -574,6 +575,7 @@ def delete_rule(db: Session, dataset_id: int, rule_code: str) -> Dict[str, Any]:
             severity="warning",
             link=f"/dq-rules",
             dataset=ds_name,
+            dataset_id=dataset_id,
         )
     except Exception:
         pass
@@ -692,6 +694,7 @@ def create_rule(
             severity="info" if severity.lower() in ("low", "medium") else "warning",
             link=f"/dq-rules",
             dataset=ds_name,
+            dataset_id=dataset_id,
         )
     except Exception as _ne:
         pass
@@ -742,7 +745,7 @@ def approve_ai_recommended_rule(db: Session, dataset_id: int, rule_payload: Dict
     created = create_rule(
         db,
         dataset_id,
-        input_mode="ai",        # FIXED: was "dsl" — AI-approved rules must be detectable
+        input_mode="dsl",
         text=condition,
         name=name,
         rule_type=rule_type,
@@ -750,23 +753,6 @@ def approve_ai_recommended_rule(db: Session, dataset_id: int, rule_payload: Dict
         severity=severity,
         status="Active",
     )
-    # Also stamp source='ai' so health_metrics_router can detect AI origin
-    # via dq_rules.source (which the schema discovery finds as rule_source_col)
-    try:
-        if isinstance(created, dict) and created.get("id"):
-            from sqlalchemy import text as _text
-            from app.database import engine as _eng
-            with _eng.connect() as _c:
-                _c.execute(_text("UPDATE dq_rules SET source = 'ai' WHERE id = :id"), {"id": created["id"]})
-                _c.commit()
-        elif hasattr(created, "id"):
-            from sqlalchemy import text as _text
-            from app.database import engine as _eng
-            with _eng.connect() as _c:
-                _c.execute(_text("UPDATE dq_rules SET source = 'ai' WHERE id = :id"), {"id": created.id})
-                _c.commit()
-    except Exception as _src_err:
-        print(f"[dq_rules] source='ai' stamp failed (non-fatal): {_src_err}")
  
     if existing_pending_rules:
         for pending_rule in existing_pending_rules:
@@ -955,6 +941,7 @@ def get_ai_recommended_rules(db: Session, dataset_id: int):
                 severity="info",
                 link="/dq-rules",
                 dataset=str(dataset_id),
+                dataset_id=dataset_id,
             )
  
     except Exception:

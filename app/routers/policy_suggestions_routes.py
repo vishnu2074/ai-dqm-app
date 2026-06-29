@@ -1327,40 +1327,86 @@ def dismiss_suggestion(suggestion_id: str):
 
 def adopt_suggestion(suggestion_id: str, request: Request, db: Session = Depends(get_db)):
 
-    """Adopt a suggestion and create an audit log entry."""
+    """
+    FIXED: Now creates a real GovernancePolicy record in the DB (Active, source='ai')
+    so the policy appears in the Data Policies tab and counts in health metrics.
+    Previously only added to in-memory _adopted set — lost on every redeploy.
+    """
 
     _adopted.add(suggestion_id)
 
     cached = next((s for s in _suggestions_cache if s["id"] == suggestion_id), None)
- 
-    try:
 
-        from app.routers.governance_routes import _audit, _usr, _ip
+    policy_record = None
+    try:
+        from app.routers.governance_routes import (
+            GovernancePolicy, GovernanceDismissedSuggestion,
+            _audit, _usr, _ip, _p2d, _notify_for_action
+        )
+        from app.database import SessionLocal as _SL
+        from sqlalchemy import func as _func
+        from datetime import date as _date
+        import uuid as _uuid
+
+        policy_name = cached.get("name", f"AI Policy {suggestion_id}") if cached else f"AI Policy {suggestion_id}"
+        policy_desc = cached.get("description", "") if cached else ""
+        policy_type = cached.get("policy_type", "Quality") if cached else "Quality"
+
+        # Check if already exists
+        existing = db.query(GovernancePolicy).filter(
+            _func.lower(GovernancePolicy.name) == policy_name.lower()
+        ).first()
+
+        if existing:
+            existing.status = "Active"
+            existing.updated_at = str(_date.today())
+            db.commit()
+            policy_record = _p2d(existing)
+        else:
+            p = GovernancePolicy(
+                id=f"p_{_uuid.uuid4().hex[:8]}",
+                name=policy_name,
+                description=policy_desc,
+                status="Active",
+                policy_type=policy_type,
+                source="ai",
+                datasets_count=0,
+                rules=[],
+                created_at=str(_date.today()),
+                updated_at=str(_date.today()),
+            )
+            db.add(p)
+
+            # Mark dismissed in governance DB so it leaves suggestions
+            if not db.query(GovernanceDismissedSuggestion).filter(
+                GovernanceDismissedSuggestion.id == suggestion_id
+            ).first():
+                db.add(GovernanceDismissedSuggestion(id=suggestion_id))
+
+            db.commit()
+            policy_record = _p2d(p)
 
         _audit(
-
-            db, "Policy Suggestion Adopted", "Suggestion",
-
-            cached.get("name", "Unknown") if cached else "Unknown",
-
-            f"Adopted AI-suggested policy: {cached.get('name', '') if cached else ''}",
-
+            db, "Policy Suggestion Adopted", "Policy",
+            policy_name,
+            f"AI-suggested policy adopted and created as Active {policy_type} policy",
             "info", _usr(request), _ip(request)
-
+        )
+        _notify_for_action(
+            db, "policy",
+            f"AI Policy Adopted: {policy_name}",
+            f"AI-suggested policy '{policy_name}' was adopted and is now Active.",
+            severity="info", link="/settings?tab=policies"
         )
 
-    except Exception:
+    except Exception as e:
+        print(f"[adopt_suggestion] Failed to create policy record (non-fatal): {e}")
 
-        pass
- 
     return {
-
         "status": "adopted",
-
         "id": suggestion_id,
-
+        "policy": policy_record,
         "recommended_action": cached.get("recommended_action") if cached else None,
-
     }
  
  
