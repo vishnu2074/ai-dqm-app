@@ -1,22 +1,26 @@
 """
 app/routers/knowledge_graph.py
 
-KEY FIX: /knowledge-graph endpoint now calls kg_engine.detect_relationships()
-directly instead of going through KnowledgeGraphService.build_graph() which
-called build_column_graph() (a visual renderer that reads but NEVER writes edges).
-detect_relationships() calls _save_edges() which persists to knowledge_graph_edges
-with correct INTEGER FKs — this is why the table was always 0 edges.
+Knowledge Graph endpoints.
 
-The router still calls service.build_column_graph() AFTER detect_relationships()
-to return the visual graph the frontend expects (nodes+edges for display).
+Key fixes:
+ - /knowledge-graph (dataset_ids): The KG engine (kg_engine.detect_relationships)
+   already persists edges to knowledge_graph_edges with correct INTEGER FKs via
+   _save_edges(). The old router _persist_kg_edges() was redundant and wrote
+   wrong schema (text to INTEGER FK columns). Removed.
+ - /knowledge-graph/folder: The service uses Azure Blob (no DB session), so
+   we do need a persistence step here. Fixed to resolve dataset names → integer
+   IDs from the datasets table before inserting.
 """
 import os
+from datetime import datetime
 from fastapi import APIRouter, Depends, Body
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List
 from sqlalchemy.orm import Session
 from azure.storage.blob import BlobServiceClient
 from app.database import SessionLocal
+from app.services.knowledge_graph import KnowledgeGraphService
 
 router = APIRouter()
 
@@ -33,9 +37,10 @@ def get_db():
 
 def _persist_folder_kg_edges(edges: list, folder: str) -> int:
     """
-    Persist KG edges from folder-mode builds.
-    Resolves string names to INTEGER dataset IDs from the datasets table.
-    Non-fatal.
+    Persist KG edges from folder-mode builds (Azure Blob path).
+    Folder builds produce edges with string source/target names (dataset names),
+    so we resolve them to INTEGER dataset IDs from the datasets table.
+    Non-fatal — persistence failure never breaks the API response.
     """
     if not edges:
         return 0
@@ -45,12 +50,15 @@ def _persist_folder_kg_edges(edges: list, folder: str) -> int:
         from sqlalchemy import text
 
         with engine.connect() as conn:
+            # Verify table exists
             tbl = conn.execute(text(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='knowledge_graph_edges'"
             )).fetchone()
             if not tbl:
+                print("[kg_persist_folder] knowledge_graph_edges table missing")
                 return 0
 
+            # Build name → id lookup
             ds_rows = conn.execute(text(
                 "SELECT id, physical_name, display_name FROM datasets"
             )).fetchall()
@@ -92,6 +100,7 @@ def _persist_folder_kg_edges(edges: list, folder: str) -> int:
                         return v, id_to_name.get(v, name_str)
                 return None, None
 
+            # Invalidate previous folder edges
             try:
                 conn.execute(text(
                     "UPDATE knowledge_graph_edges SET invalidated = 1 "
@@ -102,6 +111,7 @@ def _persist_folder_kg_edges(edges: list, folder: str) -> int:
 
             skipped = 0
             for edge in edges:
+                # Support both source_dataset_id (already integer) and source (string name)
                 if isinstance(edge.get("source_dataset_id"), int):
                     src_id   = edge["source_dataset_id"]
                     src_name = edge.get("source_dataset_name", "")
@@ -109,7 +119,7 @@ def _persist_folder_kg_edges(edges: list, folder: str) -> int:
                 else:
                     src_name_raw = edge.get("source") or edge.get("from") or edge.get("source_dataset", "")
                     src_id, src_name = find_id(src_name_raw)
-                    src_col = edge.get("source_column") or "unknown"
+                    src_col = edge.get("source_column") or edge.get("src_col") or "unknown"
 
                 if isinstance(edge.get("target_dataset_id"), int):
                     tgt_id   = edge["target_dataset_id"]
@@ -118,7 +128,7 @@ def _persist_folder_kg_edges(edges: list, folder: str) -> int:
                 else:
                     tgt_name_raw = edge.get("target") or edge.get("to") or edge.get("target_dataset", "")
                     tgt_id, tgt_name = find_id(tgt_name_raw)
-                    tgt_col = edge.get("target_column") or "unknown"
+                    tgt_col = edge.get("target_column") or edge.get("tgt_col") or "unknown"
 
                 if src_id is None or tgt_id is None:
                     skipped += 1
@@ -151,7 +161,8 @@ def _persist_folder_kg_edges(edges: list, folder: str) -> int:
                     print(f"[kg_persist_folder] Edge insert failed: {ie}")
 
             conn.commit()
-            print(f"[kg_persist_folder] Saved {saved}/{len(edges)} edges ({skipped} skipped)")
+            suffix = f" ({skipped} skipped — names not in datasets table)" if skipped else ""
+            print(f"[kg_persist_folder] Saved {saved}/{len(edges)} edges{suffix}")
 
     except Exception as e:
         print(f"[kg_persist_folder] Persistence failed (non-fatal): {e}")
@@ -164,40 +175,16 @@ def _persist_folder_kg_edges(edges: list, folder: str) -> int:
 def get_knowledge_graph(
     dataset_ids: List[int] = Body(...),
     db: Session = Depends(get_db),
-    force_rerun: bool = False,
 ):
     """
     Build knowledge graph for specified datasets.
-
-    FIXED: Now calls detect_relationships() directly which persists edges to
-    knowledge_graph_edges via _save_edges(). Previously called build_graph()
-    on the service which called build_column_graph() — a visual-only function
-    that READS edges but never WRITES them, hence always 0 in the DB.
-
-    Returns the visual graph (nodes+edges) for frontend rendering.
+    The KG engine (kg_engine.detect_relationships → _save_edges) handles
+    DB persistence with correct INTEGER FKs automatically — no extra
+    persistence step needed here.
     """
-    from app.graph.kg_engine import detect_relationships, build_column_graph
-
-    # Step 1: Run relationship detection — this persists edges to the DB
-    detect_result = detect_relationships(db, dataset_ids, force_rerun=force_rerun)
-    print(f"[kg_router] detect_relationships: {detect_result.get('status')} "
-          f"— {detect_result.get('edges_saved', 0)} edges saved")
-
-    # Step 2: Build visual graph from the now-populated DB edges
-    visual_result = build_column_graph(db, dataset_ids)
-
-    # Merge detect_result stats into visual_result for frontend info
-    visual_result["kg_stats"] = {
-        "status":              detect_result.get("status"),
-        "edges_saved":         detect_result.get("edges_saved", 0),
-        "relationships_found": detect_result.get("relationships_found", 0),
-        "pairs_compared":      detect_result.get("pairs_compared", 0),
-        "llm_calls":           detect_result.get("llm_calls", 0),
-        "elapsed_ms":          detect_result.get("elapsed_ms", 0),
-        "message":             detect_result.get("message", ""),
-    }
-
-    return visual_result
+    service = KnowledgeGraphService()
+    result = service.build_graph(db, dataset_ids)
+    return result
 
 
 class FolderRequest(BaseModel):
@@ -212,13 +199,12 @@ def get_kg_from_folder(req: FolderRequest):
     using the fixed name→id resolver.
     """
     try:
-        from app.services.knowledge_graph import KnowledgeGraphService
         service = KnowledgeGraphService()
         result = service.build_graph_from_folder(req.folder)
 
+        # Persist folder-mode edges (engine doesn't do this for folder path)
         try:
-            raw_edges = (result.get("edges") or result.get("relationships", [])
-                         if isinstance(result, dict) else [])
+            raw_edges = result.get("edges") or result.get("relationships", []) if isinstance(result, dict) else []
             if raw_edges:
                 _persist_folder_kg_edges(raw_edges, folder=req.folder)
         except Exception as e:
@@ -234,22 +220,6 @@ def get_kg_from_folder(req: FolderRequest):
                 "error": "LLM not configured — set AZURE_OPENAI_API_KEY in app.yaml"
             }
         raise
-
-
-@router.post("/knowledge-graph/detect")
-def detect_kg_relationships(
-    dataset_ids: Optional[List[int]] = Body(default=None),
-    force_rerun: bool = False,
-    db: Session = Depends(get_db),
-):
-    """
-    Explicit relationship detection endpoint.
-    Returns detection stats rather than the visual graph.
-    Useful for triggering a fresh analysis without rebuilding the visual.
-    """
-    from app.graph.kg_engine import detect_relationships
-    result = detect_relationships(db, dataset_ids, force_rerun=force_rerun)
-    return result
 
 
 @router.get("/folders")
