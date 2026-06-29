@@ -1916,18 +1916,18 @@ def _tab_azure_llm(conn) -> dict:
             _now = _dt.now(_tz.utc)
             _cutoff = (_now - _td(hours=window_hours)).isoformat()
             _all = _scalar(conn,
-                "SELECT COUNT(*) FROM llm_calls WHERE timestamp >= :c", (_cutoff,), default=0)
+                "SELECT COUNT(*) FROM llm_calls WHERE timestamp >= :c", {"c": _cutoff}, default=0)
             _succ = _scalar(conn,
-                "SELECT COUNT(*) FROM llm_calls WHERE timestamp >= :c AND success = 1", (_cutoff,), default=0)
+                "SELECT COUNT(*) FROM llm_calls WHERE timestamp >= :c AND success = 1", {"c": _cutoff}, default=0)
             _err  = _scalar(conn,
-                "SELECT COUNT(*) FROM llm_calls WHERE timestamp >= :c AND success = 0", (_cutoff,), default=0)
+                "SELECT COUNT(*) FROM llm_calls WHERE timestamp >= :c AND success = 0", {"c": _cutoff}, default=0)
             _pt = _scalar(conn,
-                "SELECT COALESCE(SUM(prompt_tokens),0) FROM llm_calls WHERE timestamp >= :c", (_cutoff,), default=0)
+                "SELECT COALESCE(SUM(prompt_tokens),0) FROM llm_calls WHERE timestamp >= :c", {"c": _cutoff}, default=0)
             _ct = _scalar(conn,
-                "SELECT COALESCE(SUM(completion_tokens),0) FROM llm_calls WHERE timestamp >= :c", (_cutoff,), default=0)
+                "SELECT COALESCE(SUM(completion_tokens),0) FROM llm_calls WHERE timestamp >= :c", {"c": _cutoff}, default=0)
             _lat_row = _one(conn,
                 "SELECT AVG(latency_ms), MAX(latency_ms), MIN(latency_ms) FROM llm_calls WHERE timestamp >= :c AND latency_ms IS NOT NULL",
-                (_cutoff,))
+                {"c": _cutoff})
             _at  = _scalar(conn, "SELECT COUNT(*) FROM llm_calls", default=0)
             _apt = _scalar(conn, "SELECT COALESCE(SUM(prompt_tokens),0) FROM llm_calls", default=0)
             _act = _scalar(conn, "SELECT COALESCE(SUM(completion_tokens),0) FROM llm_calls", default=0)
