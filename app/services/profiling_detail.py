@@ -8,7 +8,7 @@ try:
 except ImportError:
     httpx = None
 import time as _time
-from app.services.llm_tracker import track_llm_call
+from app.services.llm_tracker import track_llm_call, status_code_suffix
 import requests as _http
 from datetime import timedelta, timezone
 from typing import Any
@@ -386,7 +386,7 @@ def _ai_dataset_description(ds_name: str, total_rows: int, columns: list[dict], 
         track_llm_call(
             feature="profiling", model=os.getenv("AZURE_OPENAI_MODEL", "Llama-3.3-70B-Instruct"),
             latency_ms=(_time.time() - _t0) * 1000 if "_t0" in dir() else 0,
-            success=False, error_type=type(e).__name__, input_length=len(prompt),
+            success=False, error_type=status_code_suffix(e), input_length=len(prompt),
         )
         print(f"[profiling] LLM client description failed (non-fatal): {e}")
 
@@ -405,7 +405,17 @@ def _ai_dataset_description(ds_name: str, total_rows: int, columns: list[dict], 
             )
             model_name = os.getenv("AZURE_OPENAI_DEPLOYMENT", os.getenv("AZURE_OPENAI_MODEL", "Llama-3.3-70B-Instruct"))
             _t1 = _time.time()
-            r = _http.post(f"{_ENDPOINT}/chat/completions", headers={"Content-Type": "application/json", "api-key": _KEY},
+            # Compute correct URL — AI Foundry uses /models/chat/completions,
+            # Azure OpenAI Service uses /chat/completions directly.
+            _ep_norm = _ENDPOINT
+            for _sfx in ["/chat/completions", "/models"]:
+                while _ep_norm.endswith(_sfx):
+                    _ep_norm = _ep_norm[:-len(_sfx)].rstrip("/")
+            if "services.ai.azure.com" in _ep_norm:
+                _chat_url = f"{_ep_norm}/models/chat/completions"
+            else:
+                _chat_url = f"{_ep_norm}/chat/completions"
+            r = _http.post(_chat_url, headers={"Content-Type": "application/json", "api-key": _KEY},
                 json={"model": model_name, "messages": [{"role": "user", "content": prompt}], "temperature": 0.3, "max_tokens": 600}, timeout=35)
             r.raise_for_status()
             body = r.json()
@@ -425,7 +435,7 @@ def _ai_dataset_description(ds_name: str, total_rows: int, columns: list[dict], 
             track_llm_call(
                 feature="profiling", model=os.getenv("AZURE_OPENAI_MODEL", "Llama-3.3-70B-Instruct"),
                 latency_ms=(_time.time() - _t1) * 1000 if "_t1" in dir() else 0,
-                success=False, error_type=type(e).__name__, input_length=len(prompt),
+                success=False, error_type=status_code_suffix(e), input_length=len(prompt),
             )
             print(f"[profiling] HTTP AI description failed (non-fatal): {e}")
 

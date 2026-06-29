@@ -1,11 +1,16 @@
 """
-python-backend/app/routers/knowledge_graph.py
-Knowledge Graph endpoints for automatic relationship discovery
+app/routers/knowledge_graph.py
 
-FIXED:
-  - service.build_graph(db, dataset_ids) — args were swapped
-  - KG edges now persisted to knowledge_graph_edges table after every build
-    so health metrics (kg_build_status, kg_relationship_precision) show real data
+Knowledge Graph endpoints.
+
+Key fixes:
+ - /knowledge-graph (dataset_ids): The KG engine (kg_engine.detect_relationships)
+   already persists edges to knowledge_graph_edges with correct INTEGER FKs via
+   _save_edges(). The old router _persist_kg_edges() was redundant and wrote
+   wrong schema (text to INTEGER FK columns). Removed.
+ - /knowledge-graph/folder: The service uses Azure Blob (no DB session), so
+   we do need a persistence step here. Fixed to resolve dataset names → integer
+   IDs from the datasets table before inserting.
 """
 import os
 from datetime import datetime
@@ -28,46 +33,32 @@ def get_db():
         db.close()
 
 
-# ── KG Edge Persistence ───────────────────────────────────────────────────────
+# ── Folder-mode KG Persistence ────────────────────────────────────────────────
 
-def _persist_kg_edges(edges: list, folder: str = None) -> int:
+def _persist_folder_kg_edges(edges: list, folder: str) -> int:
     """
-    FIXED: Persist KG edges using the CORRECT KnowledgeGraphEdge model schema:
-        source_dataset_id  INTEGER FK NOT NULL
-        source_column      TEXT NOT NULL  (defaults to 'unknown')
-        source_dataset_name TEXT
-        target_dataset_id  INTEGER FK NOT NULL
-        target_column      TEXT NOT NULL
-        target_dataset_name TEXT
-        relationship_type  TEXT NOT NULL
-        confidence         FLOAT
-        method             TEXT
-        llm_explanation    TEXT
-        invalidated        BOOLEAN (0=active, 1=superseded)
-
-    Resolves string source/target names from the LLM output to integer
-    dataset IDs using a multi-key lookup against the datasets table.
-    Edges that cannot be resolved are skipped and logged.
-    Non-fatal -- persistence failure never crashes the endpoint.
+    Persist KG edges from folder-mode builds (Azure Blob path).
+    Folder builds produce edges with string source/target names (dataset names),
+    so we resolve them to INTEGER dataset IDs from the datasets table.
+    Non-fatal — persistence failure never breaks the API response.
     """
     if not edges:
         return 0
-    saved   = 0
-    skipped = 0
+    saved = 0
     try:
         from app.database import engine
         from sqlalchemy import text
 
         with engine.connect() as conn:
+            # Verify table exists
             tbl = conn.execute(text(
-                "SELECT name FROM sqlite_master "
-                "WHERE type='table' AND name='knowledge_graph_edges'"
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='knowledge_graph_edges'"
             )).fetchone()
             if not tbl:
-                print("[kg_persist] knowledge_graph_edges table missing -- skipping")
+                print("[kg_persist_folder] knowledge_graph_edges table missing")
                 return 0
 
-            # Build name->id lookup from all registered datasets
+            # Build name → id lookup
             ds_rows = conn.execute(text(
                 "SELECT id, physical_name, display_name FROM datasets"
             )).fetchall()
@@ -79,14 +70,15 @@ def _persist_kg_edges(edges: list, folder: str = None) -> int:
                 dname = (row[2] or "").strip()
                 id_to_name[did] = dname or pname
                 for raw in (pname, dname):
-                    if raw:
-                        name_to_id[raw.lower()] = did
-                        base = raw.replace("\\", "/").split("/")[-1].lower()
-                        if base and base not in name_to_id:
-                            name_to_id[base] = did
-                        stem = base.rsplit(".", 1)[0]
-                        if stem and stem not in name_to_id:
-                            name_to_id[stem] = did
+                    if not raw:
+                        continue
+                    name_to_id[raw.lower()] = did
+                    base = raw.replace("\\", "/").split("/")[-1].lower()
+                    if base:
+                        name_to_id.setdefault(base, did)
+                    stem = base.rsplit(".", 1)[0]
+                    if stem:
+                        name_to_id.setdefault(stem, did)
 
             def find_id(name_str: str):
                 if not name_str:
@@ -108,38 +100,45 @@ def _persist_kg_edges(edges: list, folder: str = None) -> int:
                         return v, id_to_name.get(v, name_str)
                 return None, None
 
-            # Mark all existing active edges as invalidated before inserting new ones
+            # Invalidate previous folder edges
             try:
                 conn.execute(text(
-                    "UPDATE knowledge_graph_edges "
-                    "SET invalidated = 1 WHERE invalidated = 0 OR invalidated IS NULL"
+                    "UPDATE knowledge_graph_edges SET invalidated = 1 "
+                    "WHERE invalidated = 0 OR invalidated IS NULL"
                 ))
             except Exception:
                 pass
 
+            skipped = 0
             for edge in edges:
-                src_name    = (edge.get("source") or edge.get("from")
-                               or edge.get("source_dataset") or "")
-                tgt_name    = (edge.get("target") or edge.get("to")
-                               or edge.get("target_dataset") or "")
-                rel_type    = (edge.get("relationship_type") or edge.get("type") or "related")
-                confidence  = float(edge.get("confidence") or edge.get("weight") or 0.0)
-                explanation = edge.get("explanation") or edge.get("llm_explanation") or ""
-                method      = edge.get("method") or ("folder" if folder else "auto")
-                src_col     = edge.get("source_column") or edge.get("src_col") or "unknown"
-                tgt_col     = edge.get("target_column") or edge.get("tgt_col") or "unknown"
+                # Support both source_dataset_id (already integer) and source (string name)
+                if isinstance(edge.get("source_dataset_id"), int):
+                    src_id   = edge["source_dataset_id"]
+                    src_name = edge.get("source_dataset_name", "")
+                    src_col  = edge.get("source_column", "unknown")
+                else:
+                    src_name_raw = edge.get("source") or edge.get("from") or edge.get("source_dataset", "")
+                    src_id, src_name = find_id(src_name_raw)
+                    src_col = edge.get("source_column") or edge.get("src_col") or "unknown"
 
-                src_id, src_dname = find_id(src_name)
-                tgt_id, tgt_dname = find_id(tgt_name)
+                if isinstance(edge.get("target_dataset_id"), int):
+                    tgt_id   = edge["target_dataset_id"]
+                    tgt_name = edge.get("target_dataset_name", "")
+                    tgt_col  = edge.get("target_column", "unknown")
+                else:
+                    tgt_name_raw = edge.get("target") or edge.get("to") or edge.get("target_dataset", "")
+                    tgt_id, tgt_name = find_id(tgt_name_raw)
+                    tgt_col = edge.get("target_column") or edge.get("tgt_col") or "unknown"
 
                 if src_id is None or tgt_id is None:
                     skipped += 1
-                    if skipped <= 5:
-                        print(f"[kg_persist] Cannot resolve '{src_name}'->'{tgt_name}' "
-                              f"(src_id={src_id}, tgt_id={tgt_id}) -- skipping")
                     continue
                 if src_id == tgt_id:
                     continue
+
+                rel_type    = edge.get("relationship_type") or edge.get("type") or "related"
+                confidence  = float(edge.get("confidence") or edge.get("weight") or 0.5)
+                explanation = edge.get("explanation") or edge.get("llm_explanation") or ""
 
                 try:
                     conn.execute(text("""
@@ -152,22 +151,23 @@ def _persist_kg_edges(edges: list, folder: str = None) -> int:
                              :tgt_id, :tgt_col, :tgt_name,
                              :rel, :conf, :method, :expl, 0)
                     """), {
-                        "src_id":   src_id,   "src_col": src_col,  "src_name": src_dname,
-                        "tgt_id":   tgt_id,   "tgt_col": tgt_col,  "tgt_name": tgt_dname,
-                        "rel":      rel_type, "conf":    confidence,
-                        "method":   method,   "expl":    explanation,
+                        "src_id": src_id, "src_col": src_col, "src_name": src_name,
+                        "tgt_id": tgt_id, "tgt_col": tgt_col, "tgt_name": tgt_name,
+                        "rel": rel_type, "conf": confidence,
+                        "method": "folder", "expl": explanation,
                     })
                     saved += 1
                 except Exception as ie:
-                    print(f"[kg_persist] Edge insert failed (non-fatal): {ie}")
+                    print(f"[kg_persist_folder] Edge insert failed: {ie}")
 
             conn.commit()
-            suffix = f" ({skipped} skipped -- unresolved names)" if skipped else ""
-            print(f"[kg_persist] Saved {saved}/{len(edges)} edges to knowledge_graph_edges{suffix}")
+            suffix = f" ({skipped} skipped — names not in datasets table)" if skipped else ""
+            print(f"[kg_persist_folder] Saved {saved}/{len(edges)} edges{suffix}")
 
     except Exception as e:
-        print(f"[kg_persist] Persistence failed (non-fatal): {e}")
+        print(f"[kg_persist_folder] Persistence failed (non-fatal): {e}")
     return saved
+
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
@@ -176,17 +176,14 @@ def get_knowledge_graph(
     dataset_ids: List[int] = Body(...),
     db: Session = Depends(get_db),
 ):
-    """Build knowledge graph for specified datasets and persist edges."""
+    """
+    Build knowledge graph for specified datasets.
+    The KG engine (kg_engine.detect_relationships → _save_edges) handles
+    DB persistence with correct INTEGER FKs automatically — no extra
+    persistence step needed here.
+    """
     service = KnowledgeGraphService()
-    result = service.build_graph(db, dataset_ids)  # FIXED: db first, dataset_ids second
-
-    # Persist to DB for health metrics
-    try:
-        if isinstance(result, dict) and result.get("edges"):
-            _persist_kg_edges(result["edges"])
-    except Exception as e:
-        print(f"[kg_persist] Post-build persistence error (non-fatal): {e}")
-
+    result = service.build_graph(db, dataset_ids)
     return result
 
 
@@ -196,23 +193,27 @@ class FolderRequest(BaseModel):
 
 @router.post("/knowledge-graph/folder")
 def get_kg_from_folder(req: FolderRequest):
-    """Build knowledge graph from Azure Blob folder and persist edges."""
+    """
+    Build knowledge graph from Azure Blob folder.
+    Folder builds operate without a DB session, so we persist edges here
+    using the fixed name→id resolver.
+    """
     try:
         service = KnowledgeGraphService()
         result = service.build_graph_from_folder(req.folder)
 
-        # Persist to DB for health metrics
+        # Persist folder-mode edges (engine doesn't do this for folder path)
         try:
-            if isinstance(result, dict) and result.get("edges"):
-                _persist_kg_edges(result["edges"], folder=req.folder)
+            raw_edges = result.get("edges") or result.get("relationships", []) if isinstance(result, dict) else []
+            if raw_edges:
+                _persist_folder_kg_edges(raw_edges, folder=req.folder)
         except Exception as e:
-            print(f"[kg_persist] Post-folder-build persistence error (non-fatal): {e}")
+            print(f"[kg_router] Post-folder-build persistence error (non-fatal): {e}")
 
         return result
 
     except Exception as e:
         err = str(e)
-        # LLM credentials missing — return empty graph instead of 500
         if "Missing credentials" in err or "AZURE_OPENAI" in err or "api_key" in err:
             return {
                 "nodes": [], "edges": [],
@@ -223,10 +224,7 @@ def get_kg_from_folder(req: FolderRequest):
 
 @router.get("/folders")
 def list_folders():
-    """
-    Lists top-level folders under dqm/raw/ in Azure Blob.
-    Always returns a list so folders.map() never crashes in the frontend.
-    """
+    """Lists top-level folders under dqm/raw/ in Azure Blob."""
     try:
         connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
         container_name    = os.getenv("AZURE_STORAGE_CONTAINER", "intern26")

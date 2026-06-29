@@ -598,13 +598,8 @@ def create_rule(
         raise ValueError("Dataset not found")
  
     mode = (input_mode or "").lower().strip()
-    # FIXED: allow "ai" input_mode — approved AI-suggested rules are stored
-    # with input_mode="ai" so health_metrics_router can detect them.
-    # "ai" mode behaves identically to "dsl" (condition passed in directly).
-    if mode not in {"nl", "regex", "dsl", "ai"}:
-        raise ValueError("input_mode must be one of: nl, regex, dsl, ai")
-    if mode == "ai":
-        mode = "dsl"   # process as DSL; persisted as "ai" via the ORM field
+    if mode not in {"nl", "regex", "dsl"}:
+        raise ValueError("input_mode must be one of: nl, regex, dsl")
  
     if severity not in ALLOWED_SEVERITY:
         raise ValueError(f"severity must be one of: {', '.join(sorted(ALLOWED_SEVERITY))}")
@@ -657,10 +652,6 @@ def create_rule(
     code = _next_rule_code(db, dataset_id)
     final_name = (name or "").strip() or f"{column} Rule"
  
-    # Re-map mode back to the caller's original input_mode value so "ai" is
-    # preserved in the database (mode was internally redirected to "dsl" for
-    # condition parsing, but the DB field must stay "ai" for health metrics).
-    persist_mode = (input_mode or "").lower().strip()
     rule = DQRule(
         dataset_id=dataset_id,
         rule_code=code,
@@ -670,7 +661,7 @@ def create_rule(
         condition=condition,
         severity=severity,
         status=status,
-        input_mode=persist_mode,
+        input_mode=mode,
         nl_text=nl_text,
         regex_pattern=regex_pattern,
         meta=None,
@@ -751,7 +742,7 @@ def approve_ai_recommended_rule(db: Session, dataset_id: int, rule_payload: Dict
     created = create_rule(
         db,
         dataset_id,
-        input_mode="ai",       # FIXED: preserve AI origin so health metrics can detect it
+        input_mode="ai",        # FIXED: was "dsl" — AI-approved rules must be detectable
         text=condition,
         name=name,
         rule_type=rule_type,
@@ -759,6 +750,23 @@ def approve_ai_recommended_rule(db: Session, dataset_id: int, rule_payload: Dict
         severity=severity,
         status="Active",
     )
+    # Also stamp source='ai' so health_metrics_router can detect AI origin
+    # via dq_rules.source (which the schema discovery finds as rule_source_col)
+    try:
+        if isinstance(created, dict) and created.get("id"):
+            from sqlalchemy import text as _text
+            from app.database import engine as _eng
+            with _eng.connect() as _c:
+                _c.execute(_text("UPDATE dq_rules SET source = 'ai' WHERE id = :id"), {"id": created["id"]})
+                _c.commit()
+        elif hasattr(created, "id"):
+            from sqlalchemy import text as _text
+            from app.database import engine as _eng
+            with _eng.connect() as _c:
+                _c.execute(_text("UPDATE dq_rules SET source = 'ai' WHERE id = :id"), {"id": created.id})
+                _c.commit()
+    except Exception as _src_err:
+        print(f"[dq_rules] source='ai' stamp failed (non-fatal): {_src_err}")
  
     if existing_pending_rules:
         for pending_rule in existing_pending_rules:

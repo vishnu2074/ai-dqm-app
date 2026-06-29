@@ -33,7 +33,16 @@ def _llm(prompt: str, max_tokens: int = 1500) -> Optional[str]:
     """Direct HTTP call to Azure AI Foundry — no openai SDK."""
     if not _KEY or not _ENDPOINT:
         return None
-    url = f"{_ENDPOINT}/chat/completions"
+    # Correct URL for Azure AI Foundry (/models/chat/completions) vs
+    # Azure OpenAI Service (/chat/completions)
+    _ep = _ENDPOINT
+    for _sfx in ["/chat/completions", "/models"]:
+        while _ep.endswith(_sfx):
+            _ep = _ep[:-len(_sfx)].rstrip("/")
+    if "services.ai.azure.com" in _ep:
+        url = f"{_ep}/models/chat/completions"
+    else:
+        url = f"{_ep}/chat/completions"
     _t0 = _time.time()
     try:
         r = _http.post(

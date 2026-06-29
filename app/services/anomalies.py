@@ -44,7 +44,15 @@ def _llm(prompt: str, max_tokens: int = 800) -> Optional[str]:
         print("[anomalies] LLM skipped: AZURE_OPENAI_API_KEY or AZURE_OPENAI_ENDPOINT not set")
         return None
 
-    url = f"{_ENDPOINT}/chat/completions"
+    # Correct URL for AI Foundry: endpoint/models/chat/completions
+    _ep = _ENDPOINT
+    for _sfx in ["/chat/completions", "/models"]:
+        while _ep.endswith(_sfx):
+            _ep = _ep[:-len(_sfx)].rstrip("/")
+    if "services.ai.azure.com" in _ep:
+        url = f"{_ep}/models/chat/completions"
+    else:
+        url = f"{_ep}/chat/completions"
     headers = {"Content-Type": "application/json", "api-key": _KEY}
     payload = {
         "model":       _MODEL,

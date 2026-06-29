@@ -123,6 +123,70 @@ def _parse_blob_path(path: str):
  
 # ── Graph builder (cached) ─────────────────────────────────────────────────────
  
+def _persist_lineage_dataset_edges(nodes: list, edges: list) -> None:
+    """
+    Write dataset-level lineage edges to the lineage_edges table with
+    source_dataset_id / target_dataset_id integer columns populated.
+    The health_metrics_router queries these columns for lineage_coverage.
+
+    Only table→table edges (both ends have dataset_db_id) are written.
+    Non-fatal — never raises.
+    """
+    # Build node_id → dataset_db_id map
+    node_to_ds: dict = {}
+    for node in nodes:
+        did = node.get("dataset_db_id")
+        if did is not None:
+            node_to_ds[node["id"]] = did
+
+    if not node_to_ds:
+        return
+
+    try:
+        from app.database import engine
+        from sqlalchemy import text
+
+        with engine.connect() as conn:
+            # Verify columns exist
+            cols = {row[1] for row in conn.execute(text("PRAGMA table_info(lineage_edges)")).fetchall()}
+            if "source_dataset_id" not in cols or "target_dataset_id" not in cols:
+                print("[lineage_engine] lineage_edges missing integer FK columns — skipping persist")
+                return
+
+            inserted = 0
+            for edge in edges:
+                src_id = node_to_ds.get(edge.get("source"))
+                tgt_id = node_to_ds.get(edge.get("target"))
+                if src_id is None or tgt_id is None or src_id == tgt_id:
+                    continue
+
+                src_node = edge.get("source", "")
+                tgt_node = edge.get("target", "")
+
+                # Upsert: update source/target_dataset_id on existing row, or insert new
+                existing = conn.execute(text(
+                    "SELECT id FROM lineage_edges WHERE source = :s AND target = :t"
+                ), {"s": src_node, "t": tgt_node}).fetchone()
+
+                if existing:
+                    conn.execute(text(
+                        "UPDATE lineage_edges SET source_dataset_id = :sid, target_dataset_id = :tid "
+                        "WHERE id = :rid"
+                    ), {"sid": src_id, "tid": tgt_id, "rid": existing[0]})
+                else:
+                    conn.execute(text(
+                        "INSERT INTO lineage_edges (source, target, source_dataset_id, target_dataset_id) "
+                        "VALUES (:s, :t, :sid, :tid)"
+                    ), {"s": src_node, "t": tgt_node, "sid": src_id, "tid": tgt_id})
+                    inserted += 1
+
+            conn.commit()
+            if inserted:
+                print(f"[lineage_engine] Persisted {inserted} dataset-level lineage edges")
+    except Exception as e:
+        print(f"[lineage_engine] _persist_lineage_dataset_edges failed (non-fatal): {e}")
+
+
 def _get_azure_graph() -> dict:
     """
     Build full lineage graph from Azure Blob path structure.
@@ -262,41 +326,16 @@ def _get_azure_graph() -> dict:
                     db3.close()
             except Exception:
                 pass  # LineageEdge table may not exist yet on first run
+
+            # ── 5. Persist dataset-level edges to lineage_edges ────────────
+            # Write source_dataset_id / target_dataset_id for health metrics.
+            # Only table→table edges carry dataset_db_id on both ends.
+            try:
+                _persist_lineage_dataset_edges(result["nodes"], result["edges"])
+            except Exception as persist_err:
+                print(f"[lineage_engine] Lineage persistence failed (non-fatal): {persist_err}")
  
             _cache.set(result)
-
-            # ── Persist dataset coverage to lineage_edges ─────────────────────
-            # health_metrics_router.lineage_coverage queries lineage_edges for
-            # source_dataset_id / target_dataset_id to compute coverage %.
-            # The lineage engine never writes to DB — we fix that here by
-            # inserting one coverage sentinel row per registered dataset
-            # that appears in the built graph.
-            try:
-                from app.database import engine as _le_engine
-                from sqlalchemy import text as _lt
-
-                with _le_engine.connect() as _lc:
-                    # Remove previous auto-generated rows (identified by source='__auto__')
-                    _lc.execute(_lt(
-                        "DELETE FROM lineage_edges WHERE source='__auto__' OR target='__auto__'"
-                    ))
-                    _inserted = 0
-                    for ds_id, node_id in dataset_file_node_map.items():
-                        if ds_id is None:
-                            continue
-                        # Check if column exists (migration may not have run yet)
-                        _lc.execute(_lt(
-                            "INSERT OR IGNORE INTO lineage_edges "
-                            "(source, target, source_dataset_id, target_dataset_id) "
-                            "VALUES ('__auto__', '__auto__', :sid, :tid)"
-                        ), {"sid": int(ds_id), "tid": int(ds_id)})
-                        _inserted += 1
-                    _lc.commit()
-                    if _inserted:
-                        print(f"[lineage_engine] ✓ Wrote {_inserted} dataset coverage rows to lineage_edges")
-            except Exception as _lpe:
-                print(f"[lineage_engine] lineage_edges persist skipped (non-fatal): {_lpe}")
-
             return result
  
         finally:

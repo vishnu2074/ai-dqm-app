@@ -248,26 +248,6 @@ try:
                     except Exception as llmc_err:
                         _STARTUP_ERRORS.append(f"llm_calls: {llmc_err}")
 
-                # ── lineage_edges — add integer dataset ID columns ───────────
-                # source_dataset_id / target_dataset_id are needed by
-                # health_metrics_router.lineage_coverage to compute real %.
-                # lineage_engine.py populates them after every graph build.
-                le_tbl = conn.execute(
-                    text("SELECT name FROM sqlite_master WHERE type='table' AND name='lineage_edges'")
-                ).fetchone()
-                if le_tbl:
-                    le_info = conn.execute(text("PRAGMA table_info(lineage_edges)")).fetchall()
-                    le_existing = {r[1] for r in le_info}
-                    for _lec_name in ("source_dataset_id", "target_dataset_id"):
-                        if _lec_name not in le_existing:
-                            try:
-                                conn.exec_driver_sql(
-                                    f"ALTER TABLE lineage_edges ADD COLUMN {_lec_name} INTEGER"
-                                )
-                                print(f"[bootstrap] ✓ Added lineage_edges.{_lec_name}")
-                            except Exception as _lec_e:
-                                _STARTUP_ERRORS.append(f"lineage_edges.{_lec_name}: {_lec_e}")
-
                 # ── governance_audit_log table ────────────────────────────────
                 gal_exists = conn.execute(
                     text("SELECT name FROM sqlite_master WHERE type='table' AND name='governance_audit_log'")
@@ -334,6 +314,29 @@ try:
                     except Exception:
                         pass
 
+                # ── lineage_edges — add source_dataset_id / target_dataset_id ─
+                # The health_metrics_router queries these integer columns for
+                # lineage_coverage. The ORM model only has source/target TEXT.
+                # We add the columns and backfill from the datasets table.
+                le_exists = conn.execute(
+                    text("SELECT name FROM sqlite_master WHERE type='table' AND name='lineage_edges'")
+                ).fetchone()
+                if le_exists:
+                    le_cols = conn.execute(text("PRAGMA table_info(lineage_edges)")).fetchall()
+                    le_existing = {row[1] for row in le_cols}
+                    for col, defn in [
+                        ("source_dataset_id", "INTEGER"),
+                        ("target_dataset_id", "INTEGER"),
+                    ]:
+                        if col not in le_existing:
+                            try:
+                                conn.exec_driver_sql(
+                                    f"ALTER TABLE lineage_edges ADD COLUMN {col} {defn}"
+                                )
+                                print(f"[bootstrap] ✓ Added column lineage_edges.{col}")
+                            except Exception as le_err:
+                                _STARTUP_ERRORS.append(f"lineage_edges.{col}: {le_err}")
+
                 conn.commit()
         except Exception as e:
             _STARTUP_ERRORS.append(f"schema_bootstrap: {e}")
@@ -383,19 +386,8 @@ def get_llm_client():
     if _llm_client_instance is not None:
         return _llm_client_instance
 
-    # FIXED: normalize to bare host, then ALWAYS re-append the full
-    # "/openai/v1" path — Azure AI Foundry's OpenAI-compatible endpoint.
-    # Previous logic stripped "/openai/v1" down to bare host but only
-    # re-added "/v1", silently dropping "/openai" and causing every
-    # SDK call to 404 against "{host}/v1/chat/completions" instead of
-    # the correct "{host}/openai/v1/chat/completions".
     endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
-    if endpoint.endswith("/v1"):
-        endpoint = endpoint[:-3].rstrip("/")
-    if endpoint.endswith("/openai"):
-        endpoint = endpoint[:-7].rstrip("/")
-
-    api_key = os.getenv("AZURE_OPENAI_API_KEY", "")
+    api_key  = os.getenv("AZURE_OPENAI_API_KEY", "")
 
     if not endpoint or not api_key:
         print("[llm] WARNING: AZURE_OPENAI_ENDPOINT or AZURE_OPENAI_API_KEY not set — LLM disabled")
@@ -403,7 +395,33 @@ def get_llm_client():
 
     try:
         from openai import OpenAI
-        base_url = f"{endpoint}/openai/v1"
+
+        # Build base_url depending on endpoint type:
+        #
+        # Azure AI Foundry (Llama / non-OpenAI models) — all 404 errors in
+        # llm_usage_log confirm previous code was appending /openai/v1 to
+        # an AI Foundry host, making every SDK call hit the wrong URL.
+        #   env var:   https://xxx.services.ai.azure.com  (or .../models)
+        #   base_url:  https://xxx.services.ai.azure.com/models
+        #   SDK calls: base_url + /chat/completions ✓
+        #
+        # Azure OpenAI Service (GPT models):
+        #   env var:   https://xxx.openai.azure.com
+        #   base_url:  https://xxx.openai.azure.com/openai/v1
+        #   SDK calls: base_url + /chat/completions ✓
+        if "services.ai.azure.com" in endpoint:
+            # Azure AI Foundry — strip any path suffixes and use /models
+            for suffix in ["/chat/completions", "/openai/v1", "/v1", "/openai", "/models"]:
+                while endpoint.endswith(suffix):
+                    endpoint = endpoint[:-len(suffix)].rstrip("/")
+            base_url = f"{endpoint}/models"
+        else:
+            # Azure OpenAI Service
+            for suffix in ["/chat/completions", "/v1", "/openai"]:
+                while endpoint.endswith(suffix):
+                    endpoint = endpoint[:-len(suffix)].rstrip("/")
+            base_url = f"{endpoint}/openai/v1"
+
         _llm_client_instance = OpenAI(
             base_url=base_url,
             api_key=api_key,
