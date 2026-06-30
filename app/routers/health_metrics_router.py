@@ -2005,6 +2005,77 @@ def _tab_azure_llm(conn) -> dict:
     price_input_per_m = _v("price_input_per_m")
     price_output_per_m= _v("price_output_per_m")
 
+    # ── Fallback to llm_calls when llm_usage_log has no recent data ─────────
+    # llm_usage_log is written by TrackedOpenAIClient (Azure SDK intercept).
+    # llm_calls is written by app/services/llm_tracker.py on every LLM call
+    # across all 6 features (profiling, dq_rules, anomaly, kg, agent, policy).
+    # These are two independent tracking systems. When llm_usage_log shows
+    # 0 calls in the window (either because TrackedOpenAIClient isn't wired
+    # up everywhere, or because the window is genuinely quiet), llm_calls is
+    # used as a live fallback so this tab reflects real activity instead of
+    # going permanently to 0/dash.
+    if (not total_requests) and _table_exists(conn, "llm_calls"):
+        try:
+            _now = datetime.now(timezone.utc)
+            _cutoff = (_now - timedelta(hours=window_hours)).isoformat()
+
+            _all_n = _scalar(conn,
+                "SELECT COUNT(*) FROM llm_calls WHERE timestamp >= ?", (_cutoff,), default=0)
+
+            if _all_n:
+                _succ_n = _scalar(conn,
+                    "SELECT COUNT(*) FROM llm_calls WHERE timestamp >= ? AND success = 1",
+                    (_cutoff,), default=0)
+                _err_n = _scalar(conn,
+                    "SELECT COUNT(*) FROM llm_calls WHERE timestamp >= ? AND success = 0",
+                    (_cutoff,), default=0)
+                _pt_n = _scalar(conn,
+                    "SELECT COALESCE(SUM(prompt_tokens),0) FROM llm_calls WHERE timestamp >= ?",
+                    (_cutoff,), default=0)
+                _ct_n = _scalar(conn,
+                    "SELECT COALESCE(SUM(completion_tokens),0) FROM llm_calls WHERE timestamp >= ?",
+                    (_cutoff,), default=0)
+                _lat_row = _one(conn,
+                    "SELECT AVG(latency_ms), MAX(latency_ms), MIN(latency_ms) FROM llm_calls "
+                    "WHERE timestamp >= ? AND latency_ms IS NOT NULL", (_cutoff,))
+                _at_n  = _scalar(conn, "SELECT COUNT(*) FROM llm_calls", default=0)
+                _apt_n = _scalar(conn, "SELECT COALESCE(SUM(prompt_tokens),0) FROM llm_calls", default=0)
+                _act_n = _scalar(conn, "SELECT COALESCE(SUM(completion_tokens),0) FROM llm_calls", default=0)
+                _fc_row = _one(conn, "SELECT MIN(timestamp) FROM llm_calls")
+                _lc_row = _one(conn, "SELECT MAX(timestamp) FROM llm_calls")
+
+                total_requests    = _all_n
+                success_requests  = _succ_n
+                error_count       = _err_n
+                prompt_tokens     = _pt_n or None
+                completion_tokens = _ct_n or None
+                total_tokens      = (_pt_n + _ct_n) if (_pt_n or _ct_n) else None
+                avg_latency_ms    = round(_lat_row[0], 1) if (_lat_row and _lat_row[0]) else None
+                max_latency_ms    = round(_lat_row[1], 1) if (_lat_row and _lat_row[1]) else None
+                min_latency_ms    = round(_lat_row[2], 1) if (_lat_row and _lat_row[2]) else None
+                alltime_calls     = _at_n
+                alltime_tokens    = _apt_n + _act_n
+                first_call_at     = _fc_row[0] if _fc_row else None
+                last_call_at      = _lc_row[0] if _lc_row else None
+                deployment        = deployment or os.getenv("AZURE_OPENAI_MODEL", "Llama-3.3-70B-Instruct")
+
+                _price_in  = float(os.getenv("LLM_PRICE_INPUT_PER_M",  "0.71"))
+                _price_out = float(os.getenv("LLM_PRICE_OUTPUT_PER_M", "0.71"))
+                actual_cost = round(
+                    ((_pt_n or 0) / 1_000_000) * _price_in +
+                    ((_ct_n or 0) / 1_000_000) * _price_out, 6
+                )
+                alltime_cost_usd = round(
+                    (_apt_n / 1_000_000) * _price_in + (_act_n / 1_000_000) * _price_out, 6
+                )
+                cost_usd = actual_cost
+                price_input_per_m  = price_input_per_m  or _price_in
+                price_output_per_m = price_output_per_m or _price_out
+
+                logger.info(f"[azure_llm_tab] Supplemented from llm_calls: {_all_n} calls in window")
+        except Exception as _lc_err:
+            logger.warning(f"[azure_llm_tab] llm_calls fallback failed (non-fatal): {_lc_err}")
+
     # ── token_efficiency ──────────────────────────────────────────────────────
     # % of all tokens that are completions (output).
     # Status is purely data-driven: if Azure returned both values, we can judge.
@@ -2018,6 +2089,7 @@ def _tab_azure_llm(conn) -> dict:
             te_val = round((completion_tokens / denom) * 100, 2)
             if total_requests and total_requests > 0:
                 # Only flag if there were actual requests
+
                 te_status = (
                     "critical" if te_val == 0 else
                     "warning"  if te_val < 5  else
