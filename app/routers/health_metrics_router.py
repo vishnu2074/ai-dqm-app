@@ -959,15 +959,45 @@ def _tab_dq_rules(conn, s, dataset_id) -> dict:
     avg_live_pass_rate = round(mean(pass_rate_samples), 2) if pass_rate_samples else None
 
     # ── AI Rule Acceptance Rate: of all AI-origin rules ever suggested, what
-    #    fraction are currently Active (i.e. were approved and kept active) ─
+    #    fraction are currently Active (i.e. were approved and kept active).
+    #
+    #    0% here has two very different meanings and must not be flattened
+    #    into one status:
+    #      a) ai_total > 0 but ai_pending == ai_total (nothing reviewed yet)
+    #         -> NEUTRAL — there's simply a review backlog, not a failure
+    #      b) ai_total > 0, some were reviewed (ai_pending < ai_total) but
+    #         acceptance is still low -> the original CRITICAL-at-low-% logic
+    #         genuinely applies, since rules were looked at and rejected/left
+    #         inactive rather than just not yet triaged
     rrar_val = safe_pct(ai_active, ai_total) if ai_total else None
-    rrar_status = _status(rrar_val, healthy_ge=60, critical_lt=20) if rrar_val is not None else "neutral"
+    reviewed = ai_total - ai_pending if ai_total else 0
+    if rrar_val is None:
+        rrar_status = "neutral"
+    elif ai_pending == ai_total:
+        # every single AI suggestion is still sitting in Pending Review —
+        # this is a backlog signal, not an acceptance-quality signal
+        rrar_status = "neutral"
+    else:
+        rrar_status = _status(rrar_val, healthy_ge=60, critical_lt=20)
 
     # ── Hallucinated Rule Rate: of AI-origin rules that are Active, what
     #    fraction have never produced a live pass rate (no matching column
-    #    profile data exists, so the rule is unverifiable / inert) ──────────
-    hrr_val = safe_pct(ai_never_executed, ai_active) if ai_active else None
-    hrr_status = _status(hrr_val, healthy_le=10, critical_gt=50) if hrr_val is not None else "neutral"
+    #    profile data exists, so the rule is unverifiable / inert).
+    #
+    #    When ai_active == 0 this previously went to None/dash with no
+    #    context — now it explicitly reports why (nothing approved yet, or
+    #    no AI rules at all) so the card never reads as silently broken.
+    if ai_active > 0:
+        hrr_val = safe_pct(ai_never_executed, ai_active)
+        hrr_status = _status(hrr_val, healthy_le=10, critical_gt=50)
+        hrr_note = None
+    elif ai_total > 0:
+        hrr_val, hrr_status = None, "neutral"
+        hrr_note = (f"{ai_total} AI-suggested rule(s) exist but none are Active yet "
+                    f"({ai_pending} pending review) — approve at least one to measure this.")
+    else:
+        hrr_val, hrr_status = None, "neutral"
+        hrr_note = "No AI-suggested rules exist for this scope yet."
 
     # ── Dataset Rule Coverage ─────────────────────────────────────────────
     covered = 0
@@ -995,14 +1025,18 @@ def _tab_dq_rules(conn, s, dataset_id) -> dict:
               rrar_val, "%", rrar_status,
               "ai_origin_rules_currently_active / ai_origin_rules_total × 100",
               {"ai_active": ai_active, "ai_pending_review": ai_pending,
-               "ai_total": ai_total, "manual_rules": manual_rules,
-               "origin_detection": "input_mode='ai' OR meta.origin='ai' (stamped on approval)"}),
+               "ai_total": ai_total, "ai_reviewed": reviewed, "manual_rules": manual_rules,
+               "origin_detection": "input_mode='ai' OR meta.origin='ai' (stamped on approval)",
+               "note": (f"All {ai_total} AI suggestion(s) are still pending review — "
+                        f"approve or dismiss them in the DQ Rules tab to move this metric."
+                        if (ai_total and ai_pending == ai_total) else None)}),
 
             M("hallucinated_rule_rate", "Hallucinated Rule Rate",
               hrr_val, "%", hrr_status,
               "ai_origin_active_rules_with_no_live_pass_rate / ai_origin_active_rules × 100",
               {"ai_never_executed": ai_never_executed, "ai_executed": ai_executed,
-               "ai_active": ai_active}),
+               "ai_active": ai_active, "ai_total": ai_total, "ai_pending_review": ai_pending,
+               "note": hrr_note}),
 
             M("rule_coverage_rate", "Dataset Rule Coverage",
               rcr_val, "%", rcr_status,
