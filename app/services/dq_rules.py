@@ -514,7 +514,6 @@ def update_rule(db: Session, dataset_id: int, rule_code: str, updates: Dict[str,
             severity="info",
             link=f"/dq-rules",
             dataset=ds_name,
-            dataset_id=dataset_id,
         )
     except Exception:
         pass
@@ -575,7 +574,6 @@ def delete_rule(db: Session, dataset_id: int, rule_code: str) -> Dict[str, Any]:
             severity="warning",
             link=f"/dq-rules",
             dataset=ds_name,
-            dataset_id=dataset_id,
         )
     except Exception:
         pass
@@ -694,7 +692,6 @@ def create_rule(
             severity="info" if severity.lower() in ("low", "medium") else "warning",
             link=f"/dq-rules",
             dataset=ds_name,
-            dataset_id=dataset_id,
         )
     except Exception as _ne:
         pass
@@ -745,7 +742,7 @@ def approve_ai_recommended_rule(db: Session, dataset_id: int, rule_payload: Dict
     created = create_rule(
         db,
         dataset_id,
-        input_mode="ai",
+        input_mode="dsl",
         text=condition,
         name=name,
         rule_type=rule_type,
@@ -753,6 +750,27 @@ def approve_ai_recommended_rule(db: Session, dataset_id: int, rule_payload: Dict
         severity=severity,
         status="Active",
     )
+ 
+    # FIXED: input_mode becomes "dsl" once approved (it tracks *editing* method,
+    # not provenance) — previously this permanently destroyed the rule's AI
+    # origin the instant it was approved, so health metrics could never
+    # distinguish "AI-suggested then approved" from "always manual". We stamp
+    # meta.origin = "ai" on the row so origin survives regardless of input_mode.
+    try:
+        rc = created.get("rule_code") if isinstance(created, dict) else getattr(created, "rule_code", None)
+        row = None
+        if rc:
+            row = (db.query(DQRule)
+                   .filter(DQRule.dataset_id == dataset_id, DQRule.rule_code == rc)
+                   .order_by(DQRule.id.desc()).first())
+        if row:
+            existing_meta = dict(row.meta) if isinstance(row.meta, dict) else {}
+            existing_meta["origin"] = "ai"
+            existing_meta["ai_approved_at"] = datetime.utcnow().isoformat()
+            row.meta = existing_meta
+            db.commit()
+    except Exception as _meta_err:
+        print(f"[dq_rules] meta.origin='ai' stamp failed (non-fatal): {_meta_err}")
  
     if existing_pending_rules:
         for pending_rule in existing_pending_rules:
@@ -931,23 +949,6 @@ def get_ai_recommended_rules(db: Session, dataset_id: int):
     db.commit()
  
     try:
-        from app.routers.notification_inbox_routes import create_inbox_notification
- 
-        if recommended_rules:
-            create_inbox_notification(
-                title="AI Suggested New Rules",
-                message=f"{len(recommended_rules)} new AI rules generated for dataset",
-                category="ai",
-                severity="info",
-                link="/dq-rules",
-                dataset=str(dataset_id),
-                dataset_id=dataset_id,
-            )
- 
-    except Exception:
-        pass
- 
-    try:
         ai_rules = generate_ai_rules(df)
  
     except Exception as e:
@@ -1025,8 +1026,133 @@ def get_ai_recommended_rules(db: Session, dataset_id: int):
         })
  
     db.commit()
+
+    # FIXED: notification call was previously placed BEFORE recommended_rules
+    # existed (NameError, silently swallowed by bare except). Moved here so
+    # it actually fires, and added dataset_id so it counts toward
+    # retrieval_grounding_score in health metrics.
+    try:
+        from app.routers.notification_inbox_routes import create_inbox_notification
+        if recommended_rules:
+            ds_label = (ds.display_name or ds.physical_name or f"Dataset {dataset_id}")
+            create_inbox_notification(
+                title="AI Suggested New Rules",
+                message=f"{len(recommended_rules)} new AI rule(s) generated for dataset '{ds_label}'.",
+                category="ai",
+                severity="info",
+                link="/dq-rules",
+                dataset=ds_label,
+                dataset_id=dataset_id,
+            )
+    except Exception as _notif_err:
+        print(f"[dq_rules] AI rules notification failed (non-fatal): {_notif_err}")
  
     return {
         "status": "success",
         "rules": recommended_rules
+    }
+
+# ----------------------------
+# Health-metrics support: real rule provenance + execution counts
+# ----------------------------
+
+def get_rule_provenance_counts(db: Session, dataset_id: Optional[int] = None) -> Dict[str, Any]:
+    """
+    Real counts of rule origin and live execution state, sourced directly from
+    DQRule rows (no dependency on the empty dq_rule_runs/dq_rule_run_results
+    tables, which nothing in this codebase ever writes to).
+
+    AI origin is detected two ways since input_mode is overwritten to "dsl"
+    at approval time:
+      1. input_mode == "ai"            -> still-pending AI suggestions
+      2. meta.origin == "ai"           -> AI suggestions that were approved
+         (stamped permanently by approve_ai_recommended_rule)
+
+    "Executed" here means "has a live pass rate computable right now" —
+    i.e. status is Active/Paused AND the dataset has at least one completed
+    profiling run AND a column_profiles row exists for the rule's target
+    column. This mirrors exactly what _compute_rules_for_run() already does
+    on every DQ Rules tab load, so the dashboard reflects the same reality
+    the user sees in the main app.
+    """
+    q = db.query(DQRule)
+    if dataset_id is not None:
+        q = q.filter(DQRule.dataset_id == dataset_id)
+    all_rules = q.all()
+
+    total = len(all_rules)
+    active = [r for r in all_rules if (r.status or "") == "Active"]
+    pending_review = [r for r in all_rules if (r.status or "") == "Pending Review"]
+
+    def _is_ai_origin(r: DQRule) -> bool:
+        if (r.input_mode or "").lower() == "ai":
+            return True
+        meta = r.meta if isinstance(r.meta, dict) else {}
+        return meta.get("origin") == "ai"
+
+    ai_origin_rules    = [r for r in all_rules if _is_ai_origin(r)]
+    manual_rules       = [r for r in all_rules if not _is_ai_origin(r)]
+    ai_active          = [r for r in ai_origin_rules if (r.status or "") == "Active"]
+    ai_pending         = [r for r in ai_origin_rules if (r.status or "") == "Pending Review"]
+
+    # Datasets in scope (all datasets that have at least one rule, or the
+    # single dataset_id if scoped)
+    if dataset_id is not None:
+        dataset_ids_in_scope = [dataset_id]
+    else:
+        dataset_ids_in_scope = sorted({r.dataset_id for r in all_rules if r.dataset_id})
+
+    # Latest completed run + column_profiles per dataset, reused across rules
+    runs_by_ds: Dict[int, Any] = {}
+    profiles_by_ds: Dict[int, Dict[str, Any]] = {}
+    for ds_id in dataset_ids_in_scope:
+        run = _latest_completed_run(db, ds_id)
+        runs_by_ds[ds_id] = run
+        if run:
+            profiles_by_ds[ds_id] = {p.column_name: p for p in _get_column_profiles(db, run.id)}
+        else:
+            profiles_by_ds[ds_id] = {}
+
+    def _executable(r: DQRule) -> bool:
+        if (r.status or "") not in ("Active", "Paused"):
+            return False
+        run = runs_by_ds.get(r.dataset_id)
+        if not run:
+            return False
+        return r.column in profiles_by_ds.get(r.dataset_id, {})
+
+    executed_rules        = [r for r in active if _executable(r)]
+    ai_executed_rules      = [r for r in ai_active if _executable(r)]
+    never_executed_active  = [r for r in active if not _executable(r)]
+    ai_never_executed       = [r for r in ai_active if not _executable(r)]
+
+    # Live pass rate across all currently-executable active rules
+    pass_rates: List[float] = []
+    for r in executed_rules:
+        run = runs_by_ds.get(r.dataset_id)
+        prof = profiles_by_ds.get(r.dataset_id, {}).get(r.column)
+        if run and prof:
+            pass_rates.append(_metric_for_rule(prof, r.type))
+
+    avg_pass_rate = round(sum(pass_rates) / len(pass_rates), 2) if pass_rates else None
+
+    # Dataset coverage: datasets that have >=1 Active rule, vs total datasets
+    total_datasets = db.query(Dataset).count()
+    datasets_with_active_rule = len({r.dataset_id for r in active if r.dataset_id})
+
+    return {
+        "total_rules":              total,
+        "active_rules":             len(active),
+        "pending_review_rules":     len(pending_review),
+        "manual_rules":             len(manual_rules),
+        "ai_recommended_total":     len(ai_origin_rules),
+        "ai_recommended_active":    len(ai_active),
+        "ai_recommended_pending":   len(ai_pending),
+        "executed_active_rules":    len(executed_rules),
+        "never_executed_active_rules": len(never_executed_active),
+        "ai_executed_rules":        len(ai_executed_rules),
+        "ai_never_executed_rules":  len(ai_never_executed),
+        "avg_live_pass_rate":       avg_pass_rate,
+        "datasets_with_active_rule": datasets_with_active_rule,
+        "total_datasets":           total_datasets,
     }

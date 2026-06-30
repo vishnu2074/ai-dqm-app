@@ -812,115 +812,164 @@ def _tab_dq_scores(conn, s, dataset_id) -> dict:
 
 # UPDATED DQ RULES TAB
 def _tab_dq_rules(conn, s, dataset_id) -> dict:
-    act_status  = s["rule_active_status"]
-    source_col  = s["rule_source_col"]
-    rr_rule_col = s["rr_rule_id_col"]
-    dr_cols     = _columns(conn, "dq_rules")
-    has_ds      = "dataset_id" in dr_cols
-    rr_exists   = _table_exists(conn, "dq_rule_runs")
+    """
+    REWRITTEN: dq_rule_runs / dq_rule_run_results are never written to by any
+    code path in this app (confirmed from dq_rules.py and dq_engine.py — rule
+    execution there computes pass rates LIVE against column_profiles on every
+    DQ Rules tab load, it never persists a "run" row). Querying those tables
+    for rule_execution_success_rate always returned 0/critical regardless of
+    how many rules existed or were used.
+
+    This tab now sources every metric from dq_rules + column_profiles
+    directly — the same live-computation path the main DQ Rules tab already
+    uses (_compute_rules_for_run in dq_rules.py), so the dashboard reflects
+    the same reality the user sees in the app.
+
+    AI origin detection: input_mode == 'ai' (still-pending suggestions) OR
+    meta.origin == 'ai' (approved AI suggestions — input_mode is overwritten
+    to 'dsl' at approval time, so meta.origin is the only way to track origin
+    post-approval; stamped by approve_ai_recommended_rule in dq_rules.py).
+    """
+    act_status = s["rule_active_status"]
+    dr_cols    = _columns(conn, "dq_rules")
+    has_ds     = "dataset_id" in dr_cols
+    has_meta   = "meta" in dr_cols
+    has_input_mode = "input_mode" in dr_cols
 
     ds_r = "AND dataset_id = ?" if (dataset_id and has_ds) else ""
     r_p  = [dataset_id] if ds_r else []
 
     total_datasets = _scalar(conn, "SELECT COUNT(*) FROM datasets", default=0) or 0
-    # Coverage-style metrics are measured against the scope being viewed:
-    # the single dataset when one is selected, otherwise the whole fleet.
     scope_total = 1 if dataset_id else total_datasets
 
     act_expr = f"COUNT(CASE WHEN status = '{act_status}' THEN 1 END)" if act_status else "COUNT(NULL)"
+    pending_expr = "COUNT(CASE WHEN status = 'Pending Review' THEN 1 END)"
 
     row_rules = _one(conn,
-        f"SELECT {act_expr} as active, COUNT(*) as total FROM dq_rules WHERE 1=1 {ds_r}", r_p)
-    active_rules = row_rules["active"] if row_rules else 0
-    total_rules  = row_rules["total"]  if row_rules else 0
+        f"SELECT {act_expr} as active, {pending_expr} as pending, COUNT(*) as total "
+        f"FROM dq_rules WHERE 1=1 {ds_r}", r_p)
+    active_rules  = row_rules["active"]  if row_rules else 0
+    pending_rules = row_rules["pending"] if row_rules else 0
+    total_rules   = row_rules["total"]   if row_rules else 0
 
-    # ── rule_execution_success_rate ───────────────────────────────────────────
-    # Active rules (in scope) that have AT LEAST ONE recorded run in
-    # dq_rule_runs. Joined on dq_rules.id so runs belonging to another
-    # dataset's rules can never leak into this dataset's count — the
-    # previous version counted ALL distinct rule_ids ever run, globally.
-    executed = 0
-    if rr_rule_col and rr_exists:
-        join_status = "AND r.status = ?" if act_status else ""
-        join_ds     = "AND r.dataset_id = ?" if (dataset_id and has_ds) else ""
-        join_p = ([act_status] if join_status else []) + ([dataset_id] if join_ds else [])
-        row_exec = _one(conn,
-            f"SELECT COUNT(DISTINCT rr.{rr_rule_col}) as ex "
-            f"FROM dq_rule_runs rr "
-            f"JOIN dq_rules r ON rr.{rr_rule_col} = r.id "
-            f"WHERE 1=1 {join_status} {join_ds}", join_p)
-        executed = row_exec["ex"] if row_exec else 0
+    # ── AI origin: input_mode='ai' (pending) OR meta contains "origin":"ai" ──
+    ai_total = ai_active = ai_pending = manual_rules = 0
+    if has_input_mode or has_meta:
+        ai_clause_parts = []
+        if has_input_mode:
+            ai_clause_parts.append("LOWER(input_mode) = 'ai'")
+        if has_meta:
+            # SQLite JSON: meta column stores JSON text; LIKE match is a safe,
+            # index-free way to detect the origin stamp without needing the
+            # JSON1 extension to be compiled in.
+            ai_clause_parts.append("meta LIKE '%\"origin\": \"ai\"%' OR meta LIKE '%\"origin\":\"ai\"%'")
+        ai_where = " OR ".join(f"({c})" for c in ai_clause_parts)
 
-    # Run-level detail: real pass-rate across executions, when dq_rule_runs
-    # exposes aggregate pass/total counts per run (same columns the DQ
-    # Scores tab falls back to).
-    rr_cols  = _columns(conn, "dq_rule_runs") if rr_exists else set()
-    pass_col = _find_col(rr_cols, ["passed_count", "passed", "pass_count"])
-    tot_col  = _find_col(rr_cols, ["total_count", "row_count", "evaluated_count", "total"])
-    avg_run_pass_rate = None
-    if rr_rule_col and pass_col and tot_col and rr_exists:
-        join_ds2 = "AND r.dataset_id = ?" if (dataset_id and has_ds) else ""
-        p2 = [dataset_id] if join_ds2 else []
-        row_runs = _one(conn,
-            f"SELECT COALESCE(SUM(rr.{pass_col}),0) as p, COALESCE(SUM(rr.{tot_col}),0) as t "
-            f"FROM dq_rule_runs rr JOIN dq_rules r ON rr.{rr_rule_col} = r.id "
-            f"WHERE 1=1 {join_ds2}", p2)
-        if row_runs and row_runs["t"]:
-            avg_run_pass_rate = safe_pct(row_runs["p"], row_runs["t"])
+        row_ai = _one(conn,
+            f"SELECT COUNT(*) as total FROM dq_rules WHERE ({ai_where}) {ds_r}", r_p)
+        ai_total = row_ai["total"] if row_ai else 0
+
+        row_ai_active = _one(conn,
+            f"SELECT COUNT(*) as cnt FROM dq_rules "
+            f"WHERE ({ai_where}) AND status = ? {ds_r}",
+            [act_status] + r_p) if act_status else None
+        ai_active = row_ai_active["cnt"] if row_ai_active else 0
+
+        row_ai_pending = _one(conn,
+            f"SELECT COUNT(*) as cnt FROM dq_rules "
+            f"WHERE ({ai_where}) AND status = 'Pending Review' {ds_r}", r_p)
+        ai_pending = row_ai_pending["cnt"] if row_ai_pending else 0
+
+    manual_rules = total_rules - ai_total
+
+    # ── Live execution: rules whose dataset has a completed profiling run AND
+    #    a column_profiles row for the rule's target column. This is exactly
+    #    the join _compute_rules_for_run() does on every tab load. ──────────
+    cp_exists = _table_exists(conn, "column_profiles")
+    pr_exists = _table_exists(conn, "profiling_runs")
+    executed = never_executed_active = 0
+    ai_executed = ai_never_executed = 0
+    pass_rate_samples = []
+
+    if cp_exists and pr_exists:
+        type_to_col = {
+            "completeness": "completeness", "uniqueness": "uniqueness",
+            "validity": "validity", "consistency": "consistency",
+            "accuracy": "accuracy", "timeliness": "timeliness",
+            "integrity": "integrity",
+        }
+        # Pull active (or active+ai) rules with dataset_id + column + type,
+        # then check per-rule whether a matching column_profiles row exists
+        # against that dataset's latest completed profiling_run.
+        rule_rows = _all(conn,
+            f"SELECT id, dataset_id, column, type, status, "
+            f"{'input_mode' if has_input_mode else 'NULL as input_mode'}, "
+            f"{'meta' if has_meta else 'NULL as meta'} "
+            f"FROM dq_rules WHERE status IN ('Active','Paused') {ds_r}", r_p)
+
+        # Cache latest completed run id per dataset to avoid N repeated queries
+        latest_run_cache: dict = {}
+
+        def _latest_run_id(ds_id):
+            if ds_id in latest_run_cache:
+                return latest_run_cache[ds_id]
+            row = _one(conn,
+                "SELECT id FROM profiling_runs WHERE dataset_id = ? AND status = "
+                f"'{s['pr_completed_status']}' ORDER BY id DESC LIMIT 1", [ds_id]) \
+                if s.get("pr_completed_status") else None
+            rid = row["id"] if row else None
+            latest_run_cache[ds_id] = rid
+            return rid
+
+        for rr in rule_rows:
+            run_id = _latest_run_id(rr["dataset_id"])
+            metric_col = type_to_col.get((rr["type"] or "").lower(), "health_score")
+            is_ai = False
+            if has_input_mode and (rr["input_mode"] or "").lower() == "ai":
+                is_ai = True
+            if has_meta and rr["meta"] and ('"origin": "ai"' in rr["meta"] or '"origin":"ai"' in rr["meta"]):
+                is_ai = True
+
+            prof_row = None
+            if run_id:
+                prof_row = _one(conn,
+                    f"SELECT {metric_col} as val FROM column_profiles "
+                    f"WHERE profiling_run_id = ? AND column_name = ?",
+                    [run_id, rr["column"]])
+
+            if prof_row and prof_row["val"] is not None:
+                executed += 1
+                if is_ai:
+                    ai_executed += 1
+                pass_rate_samples.append(float(prof_row["val"]))
+            else:
+                never_executed_active += 1
+                if is_ai:
+                    ai_never_executed += 1
 
     resr_val    = safe_pct(executed, active_rules)
-    # If no rules have been run at all (dq_rule_runs is empty), show neutral not critical
-    # — 0% is expected on a fresh system, not a failure state
-    _has_any_runs = (rr_exists and _scalar(conn, "SELECT COUNT(*) FROM dq_rule_runs", default=0) > 0)
+    # Neutral (not critical) when literally nothing has been run yet anywhere —
+    # 0% on a brand-new system is expected, not a failure.
     resr_status = (
         _status(resr_val, healthy_ge=80, critical_lt=30)
-        if (_has_any_runs and resr_val is not None)
+        if (active_rules > 0 and (executed > 0 or never_executed_active > 0))
         else "neutral"
     )
 
-    # ── rule_recommendation_acceptance_rate ───────────────────────────────────
-    # AI-origin values must be discovered from dq_rules.source ITSELF.
-    # The previous version borrowed "policy_source_values" — the distinct
-    # `source` values from the governance_policies table — which has
-    # nothing to do with DQ rule provenance and silently broke this metric.
-    ai_sources = set()
-    if source_col:
-        rows = _all(conn,
-            f"SELECT DISTINCT {source_col} as v FROM dq_rules WHERE {source_col} IS NOT NULL")
-        ai_keywords = ("ai", "llm", "gpt", "auto", "recommend", "generated", "model", "suggested")
-        ai_sources = {r["v"] for r in rows if r["v"] and any(k in str(r["v"]).lower() for k in ai_keywords)}
-    in_cl = ", ".join(f"'{v}'" for v in ai_sources)
+    avg_live_pass_rate = round(mean(pass_rate_samples), 2) if pass_rate_samples else None
 
-    ai_suggested = 0
-    if source_col and ai_sources:
-        row_sugg = _one(conn,
-            f"SELECT COUNT(*) as cnt FROM dq_rules WHERE {source_col} IN ({in_cl}) {ds_r}", r_p)
-        ai_suggested = row_sugg["cnt"] if row_sugg else 0
+    # ── AI Rule Acceptance Rate: of all AI-origin rules ever suggested, what
+    #    fraction are currently Active (i.e. were approved and kept active) ─
+    rrar_val = safe_pct(ai_active, ai_total) if ai_total else None
+    rrar_status = _status(rrar_val, healthy_ge=60, critical_lt=20) if rrar_val is not None else "neutral"
 
-    ai_accepted = 0
-    if source_col and ai_sources and act_status:
-        row_acc = _one(conn,
-            f"SELECT COUNT(*) as cnt FROM dq_rules WHERE {source_col} IN ({in_cl}) "
-            f"AND status = ? {ds_r}", [act_status] + r_p)
-        ai_accepted = row_acc["cnt"] if row_acc else 0
-
-    rrar_val    = safe_pct(ai_accepted, ai_suggested) if (act_status and ai_suggested) else None
-    rrar_status = _status(rrar_val, healthy_ge=70, critical_lt=20) if rrar_val is not None else "neutral"
-
-    # ── hallucinated_rule_rate ────────────────────────────────────────────────
-    never_run = 0
-    if source_col and ai_sources and ai_suggested and rr_rule_col:
-        ds_alias = "AND r.dataset_id = ?" if (dataset_id and has_ds) else ""
-        row_nv = _one(conn,
-            f"SELECT COUNT(*) as nv FROM dq_rules r "
-            f"WHERE r.{source_col} IN ({in_cl}) "
-            f"AND NOT EXISTS (SELECT 1 FROM dq_rule_runs rr WHERE rr.{rr_rule_col} = r.id) {ds_alias}",
-            r_p)
-        never_run = row_nv["nv"] if row_nv else 0
-    hrr_val    = safe_pct(never_run, ai_suggested) if ai_suggested else None
+    # ── Hallucinated Rule Rate: of AI-origin rules that are Active, what
+    #    fraction have never produced a live pass rate (no matching column
+    #    profile data exists, so the rule is unverifiable / inert) ──────────
+    hrr_val = safe_pct(ai_never_executed, ai_active) if ai_active else None
     hrr_status = _status(hrr_val, healthy_le=10, critical_gt=50) if hrr_val is not None else "neutral"
 
-    # ── rule_coverage_rate ────────────────────────────────────────────────────
+    # ── Dataset Rule Coverage ─────────────────────────────────────────────
     covered = 0
     if act_status:
         row_cov = _one(conn,
@@ -935,22 +984,25 @@ def _tab_dq_rules(conn, s, dataset_id) -> dict:
         "metrics": [
             M("rule_execution_success_rate", "Rule Execution Rate",
               resr_val, "%", resr_status,
-              "active_rules_in_scope_with_>=1_run_in_dq_rule_runs / active_rules_in_scope × 100",
-              {"executed": executed, "active": active_rules, "total": total_rules,
-               "active_status_used": act_status, "rule_run_fk_col": rr_rule_col or "not found",
-               "avg_run_pass_rate": avg_run_pass_rate}),
+              "active_rules_with_live_column_profile_match / active_rules × 100",
+              {"executed": executed, "never_executed": never_executed_active,
+               "active": active_rules, "total": total_rules,
+               "avg_live_pass_rate": avg_live_pass_rate,
+               "data_source": "column_profiles (live, same as DQ Rules tab) — "
+                               "dq_rule_runs is unused by the app and always empty"}),
 
             M("rule_recommendation_acceptance_rate", "AI Rule Acceptance Rate",
               rrar_val, "%", rrar_status,
-              f"dq_rules.{source_col or 'source'}_is_ai_origin_AND_status_active / ai_origin_total × 100",
-              {"accepted": ai_accepted, "suggested": ai_suggested,
-               "source_col_used": source_col or "not found",
-               "ai_source_values_detected": sorted(ai_sources)}),
+              "ai_origin_rules_currently_active / ai_origin_rules_total × 100",
+              {"ai_active": ai_active, "ai_pending_review": ai_pending,
+               "ai_total": ai_total, "manual_rules": manual_rules,
+               "origin_detection": "input_mode='ai' OR meta.origin='ai' (stamped on approval)"}),
 
             M("hallucinated_rule_rate", "Hallucinated Rule Rate",
               hrr_val, "%", hrr_status,
-              "ai_origin_rules_never_executed_in_dq_rule_runs / ai_origin_rules_total × 100",
-              {"never_run": never_run, "ai_rules": ai_suggested}),
+              "ai_origin_active_rules_with_no_live_pass_rate / ai_origin_active_rules × 100",
+              {"ai_never_executed": ai_never_executed, "ai_executed": ai_executed,
+               "ai_active": ai_active}),
 
             M("rule_coverage_rate", "Dataset Rule Coverage",
               rcr_val, "%", rcr_status,
@@ -960,14 +1012,17 @@ def _tab_dq_rules(conn, s, dataset_id) -> dict:
         ],
         "explainability": {
             "overview": (
-                f"DQ Rules tracks {total_rules} rule(s) ({active_rules} active) against real "
-                f"execution history in dq_rule_runs. AI-origin rules are detected from "
-                f"dq_rules.{source_col or 'source'} directly, not borrowed from an unrelated table."
+                f"DQ Rules tracks {total_rules} rule(s) ({active_rules} active, {pending_rules} "
+                f"pending review). {ai_total} rule(s) originated from AI suggestions "
+                f"({ai_active} approved/active), {manual_rules} created manually. Execution "
+                f"is measured live against column_profiles from each rule's dataset's latest "
+                f"completed profiling run — the same computation the DQ Rules tab itself uses."
             ),
             "improvement": (
-                "Run rules from the DQ Engine tab to populate dq_rule_runs — rule_execution_success_rate "
-                "and avg_run_pass_rate stay at 0 until then. A high hallucinated_rule_rate means "
-                "AI-suggested rules are being approved but never actually executed against real data."
+                "rule_execution_success_rate rises automatically once a dataset has a completed "
+                "profiling run covering the rule's target column — no separate 'Run' step exists "
+                "in this app's DQ Rules flow. hallucinated_rule_rate flags AI rules that are Active "
+                "but point at a column with no profiling data, meaning they can't be verified."
             ),
         },
     }
@@ -1905,63 +1960,6 @@ def _tab_azure_llm(conn) -> dict:
     alltime_tokens    = _v("alltime_tokens")
     first_call_at     = _v("first_call_at")
     last_call_at      = _v("last_call_at")
-
-    # ── Supplement from llm_calls table when llm_usage_log has no recent data ─
-    # llm_tracker.py writes to llm_calls on every LLM call. When llm_usage_log
-    # (written by TrackedOpenAIClient) shows 0 calls in the window, pull from
-    # llm_calls as a live fallback so the Azure LLM tab shows real activity.
-    if (total_requests is None or total_requests == 0) and _table_exists(conn, "llm_calls"):
-        try:
-            from datetime import datetime as _dt, timedelta as _td, timezone as _tz
-            _now = _dt.now(_tz.utc)
-            _cutoff = (_now - _td(hours=window_hours)).isoformat()
-            _all = _scalar(conn,
-                "SELECT COUNT(*) FROM llm_calls WHERE timestamp >= :c", {"c": _cutoff}, default=0)
-            _succ = _scalar(conn,
-                "SELECT COUNT(*) FROM llm_calls WHERE timestamp >= :c AND success = 1", {"c": _cutoff}, default=0)
-            _err  = _scalar(conn,
-                "SELECT COUNT(*) FROM llm_calls WHERE timestamp >= :c AND success = 0", {"c": _cutoff}, default=0)
-            _pt = _scalar(conn,
-                "SELECT COALESCE(SUM(prompt_tokens),0) FROM llm_calls WHERE timestamp >= :c", {"c": _cutoff}, default=0)
-            _ct = _scalar(conn,
-                "SELECT COALESCE(SUM(completion_tokens),0) FROM llm_calls WHERE timestamp >= :c", {"c": _cutoff}, default=0)
-            _lat_row = _one(conn,
-                "SELECT AVG(latency_ms), MAX(latency_ms), MIN(latency_ms) FROM llm_calls WHERE timestamp >= :c AND latency_ms IS NOT NULL",
-                {"c": _cutoff})
-            _at  = _scalar(conn, "SELECT COUNT(*) FROM llm_calls", default=0)
-            _apt = _scalar(conn, "SELECT COALESCE(SUM(prompt_tokens),0) FROM llm_calls", default=0)
-            _act = _scalar(conn, "SELECT COALESCE(SUM(completion_tokens),0) FROM llm_calls", default=0)
-            _fc_row = _one(conn, "SELECT MIN(timestamp) FROM llm_calls")
-            _lc_row = _one(conn, "SELECT MAX(timestamp) FROM llm_calls")
-
-            if _all > 0:
-                total_requests    = _all
-                success_requests  = _succ
-                error_count       = _err
-                prompt_tokens     = _pt or None
-                completion_tokens = _ct or None
-                total_tokens      = (_pt + _ct) if (_pt or _ct) else None
-                avg_latency_ms    = round(_lat_row[0], 1) if (_lat_row and _lat_row[0]) else None
-                max_latency_ms    = round(_lat_row[1], 1) if (_lat_row and _lat_row[1]) else None
-                min_latency_ms    = round(_lat_row[2], 1) if (_lat_row and _lat_row[2]) else None
-                alltime_calls     = _at
-                alltime_tokens    = _apt + _act
-                first_call_at     = _fc_row[0] if _fc_row else None
-                last_call_at      = _lc_row[0] if _lc_row else None
-                deployment        = deployment or os.getenv("AZURE_OPENAI_MODEL", "Llama-3.3-70B-Instruct")
-                # Estimate cost from llm_calls tokens
-                _price_in  = float(os.getenv("LLM_PRICE_INPUT_PER_M",  "0.71"))
-                _price_out = float(os.getenv("LLM_PRICE_OUTPUT_PER_M", "0.71"))
-                actual_cost = round(
-                    ((_pt or 0) / 1_000_000) * _price_in +
-                    ((_ct or 0) / 1_000_000) * _price_out, 6
-                ) if (_pt or _ct) else 0
-                alltime_cost_usd = round(
-                    (_apt / 1_000_000) * _price_in + (_act / 1_000_000) * _price_out, 6
-                )
-                logger.info(f"[azure_llm_tab] Supplemented from llm_calls: {_all} calls in window")
-        except Exception as _lc_err:
-            logger.warning(f"[azure_llm_tab] llm_calls fallback failed (non-fatal): {_lc_err}")
     models_breakdown  = _v("models") or []
     recent_calls      = _v("recent_calls") or []
     # Cost fields
